@@ -14,6 +14,7 @@ use http::request;
 use tracing::{info, instrument, trace};
 
 use crate::{
+    config::PseudoHeader,
     connection::{self, ConnectionInner},
     error::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
@@ -118,6 +119,7 @@ where
     pub(super) sender_count: Arc<AtomicUsize>,
     pub(super) _buf: PhantomData<fn(B)>,
     pub(super) send_grease_frame: bool,
+    pub(super) pseudo_header_order: Option<Vec<PseudoHeader>>,
 }
 
 impl<T, B> ConnectionState for SendRequest<T, B>
@@ -160,7 +162,14 @@ where
             extensions,
             ..
         } = parts;
-        let headers = Header::request(method, uri, headers, extensions).map_err(|_e| {
+        let headers = Header::request_with_pseudo_order(
+            method,
+            uri,
+            headers,
+            extensions,
+            self.pseudo_header_order.as_deref(),
+        )
+        .map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
                 message: "Failed to build request headers".to_string(),
@@ -244,6 +253,7 @@ where
             sender_count: self.sender_count.clone(),
             _buf: PhantomData,
             send_grease_frame: self.send_grease_frame,
+            pseudo_header_order: self.pseudo_header_order.clone(),
         }
     }
 }
@@ -442,6 +452,12 @@ where
 
                     #[cfg(feature = "tracing")]
                     info!("Server initiated graceful shutdown, last: StreamId({})", id);
+                }
+
+                // RFC 9218: PRIORITY_UPDATE from server — safe to ignore
+                Ok(Frame::PriorityUpdate { .. }) => {
+                    #[cfg(feature = "tracing")]
+                    trace!("Ignoring PRIORITY_UPDATE on control stream");
                 }
 
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5

@@ -12,6 +12,7 @@ pub mod quic;
 pub mod server;
 
 //pub use error::Error;
+pub use config::PseudoHeader;
 
 mod buf;
 

@@ -44,6 +44,7 @@ impl fmt::Display for FrameError {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Frame<B> {
     Data(B),
     Headers(Bytes),
@@ -52,6 +53,11 @@ pub enum Frame<B> {
     PushPromise(PushPromise),
     Goaway(VarInt),
     MaxPushId(PushId),
+    /// RFC 9218 PRIORITY_UPDATE for request streams (type=0xF0700).
+    PriorityUpdate {
+        element_id: u64,
+        field_value: Bytes,
+    },
     /// Describes the header for a webtransport stream.
     ///
     /// The payload is sent streaming until the stream is closed
@@ -117,6 +123,14 @@ impl Frame<PayloadLen> {
             FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
             FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
             FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
+            FrameType::PRIORITY_UPDATE_REQUEST => {
+                let element_id = payload.get_var().map_err(|_| FrameError::Malformed)?;
+                let field_value = payload.copy_to_bytes(payload.remaining());
+                Ok(Frame::PriorityUpdate {
+                    element_id,
+                    field_value,
+                })
+            }
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
             //# These frame
             //# types MUST NOT be sent, and their receipt MUST be treated as a
@@ -167,6 +181,19 @@ where
             Frame::CancelPush(id) => simple_frame_encode(FrameType::CANCEL_PUSH, (*id).into(), buf),
             Frame::Goaway(id) => simple_frame_encode(FrameType::GOAWAY, *id, buf),
             Frame::MaxPushId(id) => simple_frame_encode(FrameType::MAX_PUSH_ID, (*id).into(), buf),
+            Frame::PriorityUpdate {
+                element_id,
+                ref field_value,
+            } => {
+                FrameType::PRIORITY_UPDATE_REQUEST.encode(buf);
+                let id_var = VarInt::from_u64(*element_id).expect("element_id varint overflow");
+                buf.write_var(id_var.size() as u64 + field_value.len() as u64);
+                id_var.encode(buf);
+                // NB: `field_value` is the frame payload and is streamed
+                // separately via `payload()`/`WriteBuf`. Do NOT also write it
+                // here, or it is emitted twice — corrupting the control stream's
+                // frame boundaries after PRIORITY_UPDATE.
+            }
             Frame::Grease => {
                 FrameType::grease().encode(buf);
                 buf.write_var(6);
@@ -190,6 +217,7 @@ where
             Frame::Data(f) => Some(f),
             Frame::Headers(f) => Some(f),
             Frame::PushPromise(f) => Some(&f.encoded),
+            Frame::PriorityUpdate { field_value, .. } => Some(field_value),
             _ => None,
         }
     }
@@ -199,6 +227,7 @@ where
             Frame::Data(f) => Some(f),
             Frame::Headers(f) => Some(f),
             Frame::PushPromise(f) => Some(&mut f.encoded),
+            Frame::PriorityUpdate { field_value, .. } => Some(field_value),
             _ => None,
         }
     }
@@ -233,6 +262,9 @@ impl fmt::Debug for Frame<PayloadLen> {
             Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
             Frame::Goaway(id) => write!(f, "GoAway({})", id),
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::PriorityUpdate { element_id, .. } => {
+                write!(f, "PriorityUpdate({})", element_id)
+            }
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(session) => write!(f, "WebTransportStream({:?})", session),
         }
@@ -252,6 +284,9 @@ where
             Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
             Frame::Goaway(id) => write!(f, "GoAway({})", id),
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::PriorityUpdate { element_id, .. } => {
+                write!(f, "PriorityUpdate({})", element_id)
+            }
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(_) => write!(f, "WebTransportStream()"),
         }
@@ -272,6 +307,13 @@ impl<T, U> PartialEq<Frame<T>> for Frame<U> {
             Frame::PushPromise(x) => matches!(other, Frame::PushPromise(y) if x == y),
             Frame::Goaway(x) => matches!(other, Frame::Goaway(y) if x == y),
             Frame::MaxPushId(x) => matches!(other, Frame::MaxPushId(y) if x == y),
+            Frame::PriorityUpdate {
+                element_id,
+                field_value,
+            } => matches!(other, Frame::PriorityUpdate {
+                element_id: eid,
+                field_value: fv,
+            } if element_id == eid && field_value == fv),
             Frame::Grease => matches!(other, Frame::Grease),
             Frame::WebTransportStream(x) => {
                 matches!(other, Frame::WebTransportStream(y) if x == y)
@@ -307,6 +349,7 @@ frame_types! {
     H2_WINDOW_UPDATE = 0x8,
     H2_CONTINUATION = 0x9,
     MAX_PUSH_ID = 0xD,
+    PRIORITY_UPDATE_REQUEST = 0xF0700,
     // Reserved frame types
     WEBTRANSPORT_BI_STREAM = 0x41,
 }
@@ -457,7 +500,7 @@ setting_identifiers! {
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
 }
 
-const SETTINGS_LEN: usize = 8;
+const SETTINGS_LEN: usize = 16;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {
@@ -489,6 +532,10 @@ impl Settings {
     pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
         if self.len >= self.entries.len() {
             return Err(SettingsError::Exceeded);
+        }
+
+        if id.is_forbidden() {
+            return Err(SettingsError::InvalidSettingId(id.0));
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
@@ -657,39 +704,34 @@ mod tests {
         assert_eq!(check_frame, decoded);
     }
 
+    fn settings(entries: &[(SettingId, u64)]) -> Settings {
+        assert!(entries.len() <= SETTINGS_LEN);
+
+        let mut settings = Settings::default();
+        for (idx, &(id, value)) in entries.iter().enumerate() {
+            settings.entries[idx] = (id, value);
+        }
+        settings.len = entries.len();
+        settings
+    }
+
     #[test]
     fn settings_frame() {
         codec_frame_check(
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    (SettingId(95), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 4,
-            }),
+            Frame::Settings(settings(&[
+                (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
+                (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+                (SettingId(95), 0),
+            ])),
             &[
                 4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
             ],
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    // check without the Grease setting because this is ignored
-                    (SettingId(0), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 3,
-            }),
+            Frame::Settings(settings(&[
+                (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
+                (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+            ])),
         );
     }
 

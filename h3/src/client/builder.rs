@@ -8,7 +8,7 @@ use std::{
 use bytes::{Buf, Bytes};
 
 use crate::{
-    config::Config,
+    config::{Config, PseudoHeader},
     connection::ConnectionInner,
     error::ConnectionError,
     quic::{self},
@@ -111,6 +111,44 @@ impl Builder {
         self
     }
 
+    /// Append additional settings after the built-in client settings.
+    pub fn additional_settings(&mut self, settings: Vec<(u64, u64)>) -> &mut Self {
+        self.config.additional_settings = settings;
+        self
+    }
+
+    /// Override the exact serialized SETTINGS order.
+    pub fn ordered_settings(&mut self, settings: Vec<(u64, u64)>) -> &mut Self {
+        self.config.ordered_settings = Some(settings);
+        self
+    }
+
+    /// Override the request pseudo-header serialization order.
+    pub fn pseudo_header_order(&mut self, order: Vec<PseudoHeader>) -> &mut Self {
+        self.config.pseudo_header_order = Some(order);
+        self
+    }
+
+    /// Configure PRIORITY_UPDATE frames (RFC 9218) to send on the control
+    /// stream after SETTINGS.
+    ///
+    /// Each entry is `(element_id, field_value)` where `element_id` is the
+    /// predicted request stream ID and `field_value` is the serialized
+    /// priority field value (e.g., `b"u=1, i"`).
+    pub fn priority_updates(&mut self, updates: Vec<(u64, Vec<u8>)>) -> &mut Self {
+        self.config.priority_updates = updates;
+        self
+    }
+
+    /// Send a single GREASE frame (RFC 9114 §7.2.8 reserved type) on the
+    /// control stream after SETTINGS. Distinct from [`Self::send_grease`]:
+    /// browsers such as Chrome emit a reserved *frame* on the control stream in
+    /// addition to the reserved *setting*.
+    pub fn control_grease_frame(&mut self, enabled: bool) -> &mut Self {
+        self.config.send_control_grease_frame = enabled;
+        self
+    }
+
     /// Create a new HTTP/3 client from a `quic` connection
     pub async fn build<C, O, B>(
         &mut self,
@@ -125,14 +163,17 @@ impl Builder {
         let shared = SharedState::default();
 
         let conn_state = Arc::new(shared);
-
-        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config).await?;
+        let max_field_section_size = self.config.settings.max_field_section_size;
+        let send_grease_frame = self.config.send_grease;
+        let pseudo_header_order = self.config.pseudo_header_order.clone();
+        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config.clone()).await?;
         let send_request = SendRequest {
             open,
             conn_state,
-            max_field_section_size: self.config.settings.max_field_section_size,
+            max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
-            send_grease_frame: self.config.send_grease,
+            send_grease_frame,
+            pseudo_header_order,
             _buf: PhantomData,
         };
 

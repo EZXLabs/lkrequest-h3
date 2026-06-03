@@ -46,7 +46,7 @@ where
     Ok(())
 }
 
-const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE + Frame::MAX_ENCODED_SIZE;
+const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE + Settings::MAX_ENCODED_SIZE;
 
 /// Wrap frames to encode their header on the stack before sending them on the wire
 ///
@@ -124,6 +124,7 @@ where
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum UniStreamHeader {
     Control(Settings),
     WebTransportUni(SessionId),

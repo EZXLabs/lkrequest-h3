@@ -152,7 +152,7 @@ where
             return Ok(());
         }
 
-        let settings = frame::Settings::try_from(self.config).map_err(|_err| {
+        let settings = frame::Settings::try_from(self.config.clone()).map_err(|_err| {
             // TODO: converting a config to settings should never fail
             //       it should be impossible to construct a config which cannot be represented as settings
             self.handle_connection_error(InternalConnectionError::new(
@@ -215,29 +215,61 @@ where
         self.qpack_streams.encoder_send = encoder_send;
 
         match control {
-            Ok(control) => Ok(control),
+            Ok(_) => {}
             Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
-                Err(self.handle_connection_error(connection_error))
+                return Err(self.handle_connection_error(connection_error));
             }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => Err(self
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-                //# If either control
-                //# stream is closed at any point, this MUST be treated as a connection
-                //# error of type H3_CLOSED_CRITICAL_STREAM.
-                .handle_connection_error(InternalConnectionError::new(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!(
-                        "control stream was requested to stop sending with error code {}",
-                        err
-                    ),
-                ))),
+            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => {
+                return Err(self
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+                    //# If either control
+                    //# stream is closed at any point, this MUST be treated as a connection
+                    //# error of type H3_CLOSED_CRITICAL_STREAM.
+                    .handle_connection_error(InternalConnectionError::new(
+                        Code::H3_CLOSED_CRITICAL_STREAM,
+                        format!(
+                            "control stream was requested to stop sending with error code {}",
+                            err
+                        ),
+                    )));
+            }
             Err(StreamErrorIncoming::Unknown(error)) => {
-                Err(self.handle_connection_error(InternalConnectionError::new(
+                return Err(self.handle_connection_error(InternalConnectionError::new(
                     Code::H3_CLOSED_CRITICAL_STREAM,
                     format!("an error occurred on the control stream {}", error),
-                )))
+                )));
             }
         }
+
+        // RFC 9114 §7.2.8: optionally send a reserved GREASE frame on the
+        // control stream after SETTINGS. Chrome sends this immediately before
+        // its PRIORITY_UPDATE (browserleaks renders `…|GREASE|984832|…`), so
+        // emit it ahead of the loop below to match that order.
+        if self.config.send_control_grease_frame {
+            if let Err(_e) = stream::write(&mut self.control_send, Frame::Grease).await {
+                #[cfg(feature = "tracing")]
+                tracing::warn!("failed to send control-stream GREASE frame: {}", _e);
+            }
+        }
+
+        // RFC 9218: send PRIORITY_UPDATE frames on the control stream after SETTINGS
+        for (element_id, field_value) in &self.config.priority_updates {
+            let frame: Frame<B> = Frame::PriorityUpdate {
+                element_id: *element_id,
+                field_value: Bytes::copy_from_slice(field_value),
+            };
+            if let Err(_e) = stream::write(&mut self.control_send, frame).await {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "failed to send PRIORITY_UPDATE for element {}: {}",
+                    element_id,
+                    _e
+                );
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Initiates the connection and opens a control stream
@@ -301,6 +333,7 @@ where
         //# The
         //# sender MUST NOT close the control stream, and the receiver MUST NOT
         //# request that the sender close the control stream.
+        let send_grease = config.send_grease;
         let mut conn_inner = Self {
             shared,
             conn,
@@ -310,11 +343,11 @@ where
             handled_connection_error: None,
             pending_recv_streams: Vec::with_capacity(3),
             got_peer_settings: false,
-            send_grease_frame: config.send_grease,
+            send_grease_frame: send_grease,
             config,
             accepted_streams: Default::default(),
             // send grease stream if configured
-            send_grease_stream_flag: config.send_grease,
+            send_grease_stream_flag: send_grease,
             // start at first step
             grease_step: GreaseStatus::NotStarted(PhantomData),
         };
@@ -620,7 +653,12 @@ where
             Ok(Some(
                 frame @ Frame::Goaway(_)
                 | frame @ Frame::CancelPush(_)
-                | frame @ Frame::MaxPushId(_),
+                | frame @ Frame::MaxPushId(_)
+                // RFC 9218: PRIORITY_UPDATE is a valid control-stream frame and
+                // is handled (ignored) by the client/server impls. Without this
+                // it would fall into the catch-all below and be rejected as
+                // H3_FRAME_UNEXPECTED.
+                | frame @ Frame::PriorityUpdate { .. },
             )) => {
                 // handle these frames in client/server imples
                 frame

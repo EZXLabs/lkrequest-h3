@@ -2,8 +2,25 @@ use std::convert::TryFrom;
 
 use crate::proto::{frame, varint::VarInt};
 
+/// Request pseudo-header identifiers that can be reordered before QPACK encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoHeader {
+    /// `:method`
+    Method,
+    /// `:scheme`
+    Scheme,
+    /// `:authority`
+    Authority,
+    /// `:path`
+    Path,
+    /// `:status`
+    Status,
+    /// `:protocol`
+    Protocol,
+}
+
 /// Configures the HTTP/3 connection
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Config {
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
@@ -17,6 +34,29 @@ pub struct Config {
 
     /// HTTP/3 Settings
     pub settings: Settings,
+
+    /// Extra settings appended after the built-in settings.
+    pub(crate) additional_settings: Vec<(u64, u64)>,
+
+    /// Exact ordered settings list to serialize when present.
+    pub(crate) ordered_settings: Option<Vec<(u64, u64)>>,
+
+    /// Preferred request pseudo-header serialization order.
+    pub(crate) pseudo_header_order: Option<Vec<PseudoHeader>>,
+
+    /// PRIORITY_UPDATE frames to send on the control stream after SETTINGS.
+    ///
+    /// Each entry is `(element_id, field_value)` where `element_id` is the
+    /// request stream ID and `field_value` is the RFC 9218 priority field
+    /// value (e.g., `b"u=1, i"`).
+    pub(crate) priority_updates: Vec<(u64, Vec<u8>)>,
+
+    /// Whether to emit a single GREASE frame (RFC 9114 §7.2.8 reserved type) on
+    /// the control stream after SETTINGS. This is distinct from `send_grease`
+    /// (which only adds a reserved *setting* and greases request streams); some
+    /// browsers — notably Chrome — additionally send a reserved *frame* on the
+    /// control stream.
+    pub(crate) send_control_grease_frame: bool,
 }
 
 /// HTTP/3 Settings
@@ -86,7 +126,40 @@ impl TryFrom<Config> for frame::Settings {
                     enable_datagram,
                     max_webtransport_sessions,
                 },
+            additional_settings,
+            ordered_settings,
+            pseudo_header_order: _,
+            priority_updates: _,
+            send_control_grease_frame: _,
         } = value;
+
+        if let Some(entries) = ordered_settings {
+            for (id, val) in entries {
+                settings.insert(frame::SettingId(id), val)?;
+            }
+        } else {
+            settings.insert(
+                frame::SettingId::MAX_HEADER_LIST_SIZE,
+                max_field_section_size,
+            )?;
+            settings.insert(
+                frame::SettingId::ENABLE_CONNECT_PROTOCOL,
+                enable_extended_connect as u64,
+            )?;
+            settings.insert(
+                frame::SettingId::ENABLE_WEBTRANSPORT,
+                enable_webtransport as u64,
+            )?;
+            settings.insert(frame::SettingId::H3_DATAGRAM, enable_datagram as u64)?;
+            settings.insert(
+                frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
+                max_webtransport_sessions,
+            )?;
+
+            for (id, val) in additional_settings {
+                settings.insert(frame::SettingId(id), val)?;
+            }
+        }
 
         if send_grease {
             //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
@@ -111,24 +184,6 @@ impl TryFrom<Config> for frame::Settings {
                 }
             }
         }
-
-        settings.insert(
-            frame::SettingId::MAX_HEADER_LIST_SIZE,
-            max_field_section_size,
-        )?;
-        settings.insert(
-            frame::SettingId::ENABLE_CONNECT_PROTOCOL,
-            enable_extended_connect as u64,
-        )?;
-        settings.insert(
-            frame::SettingId::ENABLE_WEBTRANSPORT,
-            enable_webtransport as u64,
-        )?;
-        settings.insert(frame::SettingId::H3_DATAGRAM, enable_datagram as u64)?;
-        settings.insert(
-            frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
-            max_webtransport_sessions,
-        )?;
 
         Ok(settings)
     }
@@ -174,6 +229,11 @@ impl Default for Config {
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),
+            additional_settings: Vec::new(),
+            ordered_settings: None,
+            pseudo_header_order: None,
+            priority_updates: Vec::new(),
+            send_control_grease_frame: false,
         }
     }
 }

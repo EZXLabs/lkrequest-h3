@@ -271,6 +271,9 @@ where
                 //# H3_ID_ERROR.
             }
 
+            // RFC 9218: PRIORITY_UPDATE from client — accept and ignore
+            Frame::PriorityUpdate { .. } => {}
+
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
             //# A server MUST treat the
             //# receipt of a PUSH_PROMISE frame as a connection error of type

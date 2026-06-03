@@ -11,13 +11,14 @@ use http::{
     Extensions, HeaderMap, Method, StatusCode,
 };
 
-use crate::{ext::Protocol, qpack::HeaderField};
+use crate::{config::PseudoHeader, ext::Protocol, qpack::HeaderField};
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Clone))]
 pub struct Header {
     pseudo: Pseudo,
     fields: HeaderMap,
+    pseudo_order: Option<Vec<PseudoHeader>>,
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -29,12 +30,23 @@ impl Header {
         fields: HeaderMap,
         ext: Extensions,
     ) -> Result<Self, HeaderError> {
+        Self::request_with_pseudo_order(method, uri, fields, ext, None)
+    }
+
+    pub fn request_with_pseudo_order(
+        method: Method,
+        uri: Uri,
+        fields: HeaderMap,
+        ext: Extensions,
+        pseudo_order: Option<&[PseudoHeader]>,
+    ) -> Result<Self, HeaderError> {
         match (uri.authority(), fields.get("host")) {
             (None, None) => Err(HeaderError::MissingAuthority),
             (Some(a), Some(h)) if a.as_str() != h => Err(HeaderError::ContradictedAuthority),
             _ => Ok(Self {
                 pseudo: Pseudo::request(method, uri, ext),
                 fields,
+                pseudo_order: pseudo_order.map(|order| order.to_vec()),
             }),
         }
     }
@@ -43,6 +55,7 @@ impl Header {
         Self {
             pseudo: Pseudo::response(status),
             fields,
+            pseudo_order: None,
         }
     }
 
@@ -53,6 +66,7 @@ impl Header {
             //# sections.
             pseudo: Pseudo::default(),
             fields,
+            pseudo_order: None,
         }
     }
 
@@ -141,6 +155,8 @@ impl IntoIterator for Header {
     fn into_iter(self) -> Self::IntoIter {
         HeaderIter {
             pseudo: Some(self.pseudo),
+            pseudo_order: self.pseudo_order.unwrap_or_default(),
+            pseudo_index: 0,
             last_header_name: None,
             fields: self.fields.into_iter(),
         }
@@ -149,6 +165,8 @@ impl IntoIterator for Header {
 
 pub struct HeaderIter {
     pseudo: Option<Pseudo>,
+    pseudo_order: Vec<PseudoHeader>,
+    pseudo_index: usize,
     last_header_name: Option<HeaderName>,
     fields: header::IntoIter<HeaderValue>,
 }
@@ -161,6 +179,13 @@ impl Iterator for HeaderIter {
         //# All pseudo-header fields MUST appear in the header section before
         //# regular header fields.
         if let Some(ref mut pseudo) = self.pseudo {
+            while let Some(id) = self.pseudo_order.get(self.pseudo_index).copied() {
+                self.pseudo_index += 1;
+                if let Some(field) = pseudo.take_field(id) {
+                    return Some(field);
+                }
+            }
+
             if let Some(method) = pseudo.method.take() {
                 return Some((":method", method.as_str()).into());
             }
@@ -256,7 +281,11 @@ impl TryFrom<Vec<HeaderField>> for Header {
             }
         }
 
-        Ok(Header { pseudo, fields })
+        Ok(Header {
+            pseudo,
+            fields,
+            pseudo_order: None,
+        })
     }
 }
 
@@ -453,6 +482,35 @@ impl Pseudo {
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    fn take_field(&mut self, id: PseudoHeader) -> Option<HeaderField> {
+        match id {
+            PseudoHeader::Method => self
+                .method
+                .take()
+                .map(|method| (":method", method.as_str()).into()),
+            PseudoHeader::Scheme => self
+                .scheme
+                .take()
+                .map(|scheme| (":scheme", scheme.as_str().as_bytes()).into()),
+            PseudoHeader::Authority => self
+                .authority
+                .take()
+                .map(|authority| (":authority", authority.as_str().as_bytes()).into()),
+            PseudoHeader::Path => self
+                .path
+                .take()
+                .map(|path| (":path", path.as_str().as_bytes()).into()),
+            PseudoHeader::Status => self
+                .status
+                .take()
+                .map(|status| (":status", status.as_str()).into()),
+            PseudoHeader::Protocol => self
+                .protocol
+                .take()
+                .map(|protocol| (":protocol", protocol.as_str().as_bytes()).into()),
+        }
     }
 }
 
