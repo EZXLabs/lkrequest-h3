@@ -10,6 +10,7 @@
 mod h3_quinn;
 
 mod connection;
+mod grease;
 mod request;
 
 use std::{

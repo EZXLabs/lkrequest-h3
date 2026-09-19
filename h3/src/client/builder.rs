@@ -97,6 +97,22 @@ impl Builder {
         self
     }
 
+    /// Use Chromium's HTTP/3 GREASE wire format.
+    ///
+    /// Reserved setting IDs use `31 * random_u32 + 33`; values use a separate
+    /// random 32-bit draw. SETTINGS are sorted by ID, including the reserved
+    /// setting. Control GREASE frames use the same ID formula and a
+    /// random payload of zero to three bytes. Requests and extra unidirectional
+    /// streams are not greased in this mode.
+    ///
+    /// [`Self::send_grease`] still controls the reserved setting, and
+    /// [`Self::control_grease_frame`] still controls the control-stream frame.
+    /// Disabled by default to preserve the generic GREASE behavior.
+    pub fn chromium_grease(&mut self, enabled: bool) -> &mut Self {
+        self.config.chromium_grease = enabled;
+        self
+    }
+
     /// Indicates that the client supports HTTP/3 datagrams
     ///
     /// See: <https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1>
@@ -164,7 +180,7 @@ impl Builder {
 
         let conn_state = Arc::new(shared);
         let max_field_section_size = self.config.settings.max_field_section_size;
-        let send_grease_frame = self.config.send_grease;
+        let send_grease_frame = self.config.send_grease && !self.config.chromium_grease;
         let pseudo_header_order = self.config.pseudo_header_order.clone();
         let inner = ConnectionInner::new(quic, conn_state.clone(), self.config.clone()).await?;
         let send_request = SendRequest {

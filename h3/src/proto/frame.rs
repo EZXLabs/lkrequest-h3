@@ -67,6 +67,7 @@ pub enum Frame<B> {
     /// Conversely, when sending, send this frame and unwrap the stream
     WebTransportStream(SessionId),
     Grease,
+    ChromiumGrease,
 }
 
 /// Represents the available data len for a `Data` frame on a RecvStream
@@ -199,6 +200,15 @@ where
                 buf.write_var(6);
                 buf.put_slice(b"grease");
             }
+            Frame::ChromiumGrease => {
+                let random = fastrand::u32(..);
+                let len = (random % 4) as usize;
+                let mut payload = [0u8; 3];
+                fastrand::fill(&mut payload[..len]);
+                FrameType(31 * u64::from(random) + 33).encode(buf);
+                buf.write_var(len as u64);
+                buf.put_slice(&payload[..len]);
+            }
             Frame::WebTransportStream(id) => {
                 FrameType::WEBTRANSPORT_BI_STREAM.encode(buf);
                 id.encode(buf);
@@ -266,6 +276,7 @@ impl fmt::Debug for Frame<PayloadLen> {
                 write!(f, "PriorityUpdate({})", element_id)
             }
             Frame::Grease => write!(f, "Grease()"),
+            Frame::ChromiumGrease => write!(f, "ChromiumGrease()"),
             Frame::WebTransportStream(session) => write!(f, "WebTransportStream({:?})", session),
         }
     }
@@ -288,6 +299,7 @@ where
                 write!(f, "PriorityUpdate({})", element_id)
             }
             Frame::Grease => write!(f, "Grease()"),
+            Frame::ChromiumGrease => write!(f, "ChromiumGrease()"),
             Frame::WebTransportStream(_) => write!(f, "WebTransportStream()"),
         }
     }
@@ -315,6 +327,7 @@ impl<T, U> PartialEq<Frame<T>> for Frame<U> {
                 field_value: fv,
             } if element_id == eid && field_value == fv),
             Frame::Grease => matches!(other, Frame::Grease),
+            Frame::ChromiumGrease => matches!(other, Frame::ChromiumGrease),
             Frame::WebTransportStream(x) => {
                 matches!(other, Frame::WebTransportStream(y) if x == y)
             }
@@ -528,6 +541,10 @@ impl FrameHeader for Settings {
 
 impl Settings {
     pub const MAX_ENCODED_SIZE: usize = SETTINGS_LEN * 2 * VarInt::MAX_SIZE;
+
+    pub(crate) fn sort_by_id(&mut self) {
+        self.entries[..self.len].sort_unstable_by_key(|(id, _)| id.0);
+    }
 
     pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
         if self.len >= self.entries.len() {

@@ -246,7 +246,12 @@ where
         // its PRIORITY_UPDATE (browserleaks renders `…|GREASE|984832|…`), so
         // emit it ahead of the loop below to match that order.
         if self.config.send_control_grease_frame {
-            if let Err(_e) = stream::write(&mut self.control_send, Frame::Grease).await {
+            let frame = if self.config.chromium_grease {
+                Frame::ChromiumGrease
+            } else {
+                Frame::Grease
+            };
+            if let Err(_e) = stream::write(&mut self.control_send, frame).await {
                 #[cfg(feature = "tracing")]
                 tracing::warn!("failed to send control-stream GREASE frame: {}", _e);
             }
@@ -333,7 +338,7 @@ where
         //# The
         //# sender MUST NOT close the control stream, and the receiver MUST NOT
         //# request that the sender close the control stream.
-        let send_grease = config.send_grease;
+        let send_grease = config.send_grease && !config.chromium_grease;
         let mut conn_inner = Self {
             shared,
             conn,

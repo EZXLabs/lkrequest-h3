@@ -29,6 +29,9 @@ pub struct Config {
     /// and accommodate future changes without breaking existing implementations.
     pub(crate) send_grease: bool,
 
+    /// Use Chromium's GREASE values and omit request/extra unidirectional GREASE.
+    pub(crate) chromium_grease: bool,
+
     #[cfg(test)]
     pub(crate) send_settings: bool,
 
@@ -116,6 +119,7 @@ impl TryFrom<Config> for frame::Settings {
 
         let Config {
             send_grease,
+            chromium_grease,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -161,7 +165,7 @@ impl TryFrom<Config> for frame::Settings {
             }
         }
 
-        if send_grease {
+        let grease_setting = if send_grease {
             //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
             //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
@@ -176,17 +180,37 @@ impl TryFrom<Config> for frame::Settings {
             //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
             //# their receipt MUST be treated as a connection error of type
             //# H3_SETTINGS_ERROR.
-            match settings.insert(frame::SettingId::grease(), 0) {
-                Ok(_) => (),
-                Err(_err) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!("Error when adding the grease Setting. Reason {}", _err);
-                }
-            }
-        }
+            Some(if chromium_grease {
+                (
+                    frame::SettingId(31 * u64::from(fastrand::u32(..)) + 33),
+                    u64::from(fastrand::u32(..)),
+                )
+            } else {
+                (frame::SettingId::grease(), 0)
+            })
+        } else {
+            None
+        };
 
-        Ok(settings)
+        Ok(finish_settings(settings, grease_setting, chromium_grease))
     }
+}
+
+fn finish_settings(
+    mut settings: frame::Settings,
+    grease_setting: Option<(frame::SettingId, u64)>,
+    chromium_grease: bool,
+) -> frame::Settings {
+    if let Some((id, value)) = grease_setting {
+        if let Err(_err) = settings.insert(id, value) {
+            #[cfg(feature = "tracing")]
+            tracing::warn!("Error when adding the grease Setting. Reason {}", _err);
+        }
+    }
+    if chromium_grease {
+        settings.sort_by_id();
+    }
+    settings
 }
 
 impl Default for Settings {
@@ -226,6 +250,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             send_grease: true,
+            chromium_grease: false,
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),
@@ -235,5 +260,23 @@ impl Default for Config {
             priority_updates: Vec::new(),
             send_control_grease_frame: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{finish_settings, frame};
+
+    #[test]
+    fn chromium_settings_sort_low_grease_id_before_datagram() {
+        let mut settings = frame::Settings::default();
+        settings.insert(frame::SettingId(51), 1).unwrap();
+        settings.insert(frame::SettingId(7), 100).unwrap();
+        settings.insert(frame::SettingId(1), 65536).unwrap();
+
+        let settings = finish_settings(settings, Some((frame::SettingId(33), 42)), true);
+        let mut wire = Vec::new();
+        settings.encode(&mut wire);
+        assert_eq!(wire, [4, 12, 1, 0x80, 1, 0, 0, 7, 0x40, 100, 33, 42, 51, 1]);
     }
 }
