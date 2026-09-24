@@ -88,6 +88,18 @@ impl Builder {
         self
     }
 
+    /// Set the maximum QPACK dynamic table capacity this client accepts.
+    pub fn qpack_max_table_capacity(&mut self, value: u64) -> &mut Self {
+        self.config.settings.qpack_max_table_capacity = value;
+        self
+    }
+
+    /// Set the maximum number of response streams that may be QPACK-blocked.
+    pub fn qpack_blocked_streams(&mut self, value: u64) -> &mut Self {
+        self.config.settings.qpack_blocked_streams = value;
+        self
+    }
+
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
     /// to prevent potential interoperability issues in the future.
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
@@ -176,7 +188,7 @@ impl Builder {
         B: Buf,
     {
         let open = quic.opener();
-        let shared = SharedState::default();
+        let shared = SharedState::new(self.config.settings.qpack_max_table_capacity);
 
         let conn_state = Arc::new(shared);
         let max_field_section_size = self.config.settings.max_field_section_size;

@@ -138,6 +138,14 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
+    #[cfg(test)]
+    #[allow(missing_docs)]
+    pub async fn send_encoded_headers_for_test(&mut self, block: bytes::Bytes) {
+        stream::write(&mut self.inner.stream, Frame::Headers(block))
+            .await
+            .expect("send encoded response headers");
+    }
+
     /// Send the HTTP/3 response
     ///
     /// This should be called before trying to send any data with

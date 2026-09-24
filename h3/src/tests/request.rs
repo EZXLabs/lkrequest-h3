@@ -4,6 +4,7 @@ use assert_matches::assert_matches;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::future;
 use http::{request, HeaderMap, Request, Response, StatusCode};
+use std::sync::Arc;
 
 use crate::{
     client,
@@ -25,6 +26,81 @@ use crate::{
 
 use super::h3_quinn;
 use super::{init_tracing, Pair};
+
+#[tokio::test]
+async fn client_decodes_response_blocked_on_qpack_dynamic_insert() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let ack_barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let client_barrier = ack_barrier.clone();
+    let client_fut = async {
+        let mut builder = client::builder();
+        builder.qpack_max_table_capacity(4096);
+        builder.qpack_blocked_streams(100);
+        let (mut driver, mut client) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .expect("client init");
+        let drive_fut = async { future::poll_fn(|cx| driver.poll_close(cx)).await };
+        let req_fut = async move {
+            let mut request_stream = client
+                .send_request(Request::get("http://localhost/qpack").body(()).unwrap())
+                .await
+                .expect("request");
+
+            let response = request_stream.recv_response().await.expect("recv response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-dynamic"], "decoded");
+            client_barrier.wait().await;
+        };
+        tokio::join!(req_fut, drive_fut)
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming_req = server::Connection::new(conn).await.unwrap();
+        let (_request, mut request_stream) = get_stream_blocking(&mut incoming_req)
+            .await
+            .expect("accept");
+
+        let response = Response::builder()
+            .status(200)
+            .header("x-dynamic", "decoded")
+            .body(())
+            .unwrap();
+        let (parts, ()) = response.into_parts();
+        let fields = Header::response(parts.status, parts.headers);
+        let (field_section, encoder_instructions) =
+            qpack::encode_dynamic_for_test(request_stream.send_id().into_inner(), fields);
+
+        request_stream
+            .send_encoded_headers_for_test(field_section)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        incoming_req
+            .inner
+            .send_qpack_encoder_instructions_for_test(encoder_instructions)
+            .await;
+        request_stream.finish().await.expect("finish");
+
+        let decoder_instructions = incoming_req
+            .inner
+            .recv_qpack_decoder_instructions_for_test(2)
+            .await;
+        assert_eq!(&decoder_instructions[..2], &[0x01, 0x80]);
+        ack_barrier.wait().await;
+
+        assert_matches!(
+            incoming_req.accept().await.err().unwrap(),
+            ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose{error_code: code, ..})
+            if code == Code::H3_NO_ERROR.value()
+        );
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
 
 #[tokio::test]
 async fn get() {

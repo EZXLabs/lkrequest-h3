@@ -3,6 +3,44 @@ use crate::qpack::encoder::Encoder;
 use crate::qpack::{dynamic::DynamicTable, Decoded, DecoderError, HeaderField};
 use std::io::Cursor;
 
+#[test]
+fn dynamic_response_round_trip() {
+    let response = http::Response::builder()
+        .status(200)
+        .header("x-dynamic", "decoded")
+        .body(())
+        .unwrap();
+    let (parts, ()) = response.into_parts();
+    let fields = crate::proto::headers::Header::response(parts.status, parts.headers);
+    let (block, instructions) = super::encode_dynamic_for_test(0, fields);
+
+    let mut decoder = Decoder::new(4096);
+    decoder
+        .on_encoder_recv(&mut instructions.clone(), &mut Vec::new())
+        .unwrap();
+    let decoded = decoder.decode_header(&mut block.clone()).unwrap();
+    assert!(decoded.dyn_ref);
+    assert_eq!(decoded.fields.len(), 2);
+}
+
+#[test]
+fn dynamic_response_blocks_before_encoder_instructions_arrive() {
+    let response = http::Response::builder()
+        .status(200)
+        .header("x-dynamic", "decoded")
+        .body(())
+        .unwrap();
+    let (parts, ()) = response.into_parts();
+    let fields = crate::proto::headers::Header::response(parts.status, parts.headers);
+    let (block, _instructions) = super::encode_dynamic_for_test(0, fields);
+
+    let decoder = Decoder::new(4096);
+    assert_eq!(
+        decoder.decode_header(&mut block.clone()),
+        Err(DecoderError::MissingRefs(1))
+    );
+}
+
 pub mod helpers {
     use crate::qpack::{dynamic::DynamicTable, HeaderField};
 

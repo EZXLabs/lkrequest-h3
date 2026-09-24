@@ -65,6 +65,12 @@ pub struct Config {
 /// HTTP/3 Settings
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
+    /// Maximum QPACK dynamic table capacity this endpoint permits the peer to use.
+    pub(crate) qpack_max_table_capacity: u64,
+
+    /// Maximum number of request streams the peer may block on QPACK inserts.
+    pub(crate) qpack_blocked_streams: u64,
+
     /// The MAX_FIELD_SECTION_SIZE in HTTP/3 refers to the maximum size of the dynamic table used in HPACK compression.
     /// HPACK is the compression algorithm used in HTTP/3 to reduce the size of the header fields in HTTP requests and responses.
 
@@ -90,6 +96,12 @@ impl From<&frame::Settings> for Settings {
     fn from(settings: &frame::Settings) -> Self {
         let defaults: Self = Default::default();
         Self {
+            qpack_max_table_capacity: settings
+                .get(frame::SettingId::QPACK_MAX_TABLE_CAPACITY)
+                .unwrap_or(defaults.qpack_max_table_capacity),
+            qpack_blocked_streams: settings
+                .get(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS)
+                .unwrap_or(defaults.qpack_blocked_streams),
             max_field_section_size: settings
                 .get(frame::SettingId::MAX_HEADER_LIST_SIZE)
                 .unwrap_or(defaults.max_field_section_size),
@@ -124,6 +136,8 @@ impl TryFrom<Config> for frame::Settings {
                 send_settings: _,
             settings:
                 Settings {
+                    qpack_max_table_capacity,
+                    qpack_blocked_streams,
                     max_field_section_size,
                     enable_webtransport,
                     enable_extended_connect,
@@ -142,6 +156,18 @@ impl TryFrom<Config> for frame::Settings {
                 settings.insert(frame::SettingId(id), val)?;
             }
         } else {
+            if qpack_max_table_capacity > 0 {
+                settings.insert(
+                    frame::SettingId::QPACK_MAX_TABLE_CAPACITY,
+                    qpack_max_table_capacity,
+                )?;
+            }
+            if qpack_blocked_streams > 0 {
+                settings.insert(
+                    frame::SettingId::QPACK_MAX_BLOCKED_STREAMS,
+                    qpack_blocked_streams,
+                )?;
+            }
             settings.insert(
                 frame::SettingId::MAX_HEADER_LIST_SIZE,
                 max_field_section_size,
@@ -216,6 +242,8 @@ fn finish_settings(
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            qpack_max_table_capacity: 0,
+            qpack_blocked_streams: 0,
             max_field_section_size: VarInt::MAX.0,
             enable_webtransport: false,
             enable_extended_connect: false,

@@ -8,7 +8,9 @@ use tracing::instrument;
 use crate::{
     connection::{self},
     error::{
-        connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
+        connection_error_creators::{
+            convert_to_connection_error, CloseStream, HandleFrameStreamErrorOnRequestStream,
+        },
         internal_error::InternalConnectionError,
         Code, StreamError,
     },
@@ -97,7 +99,7 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let mut frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
+        let frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
             .await
             .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
             .ok_or_else(|| {
@@ -123,28 +125,8 @@ where
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = if let Frame::Headers(ref mut encoded) = frame {
-            match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                //# the message header it will accept on an individual HTTP message.
-                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                    return Err(StreamError::HeaderTooBig {
-                        actual_size: cancel_size,
-                        max_size: self.inner.max_field_section_size,
-                    });
-                }
-                Ok(decoded) => decoded,
-                Err(_e) => {
-                    return Err(
-                        self.handle_connection_error_on_stream(InternalConnectionError {
-                            code: Code::QPACK_DECOMPRESSION_FAILED,
-                            message: "Failed to decode headers".to_string(),
-                        }),
-                    )
-                }
-            }
+        let encoded = if let Frame::Headers(encoded) = frame {
+            encoded
         } else {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# Receipt of an invalid sequence of frames MUST be treated as a
@@ -157,6 +139,53 @@ where
                 )),
             );
         };
+
+        let stream_id = self.inner.stream.id().into_inner();
+        let decoded = future::poll_fn(|cx| loop {
+            let mut candidate = encoded.clone();
+            match self
+                .inner
+                .conn_state
+                .decode_qpack(&mut candidate, self.inner.max_field_section_size)
+            {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+                //# the message header it will accept on an individual HTTP message.
+                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+                    return Poll::Ready(Err(StreamError::HeaderTooBig {
+                        actual_size: cancel_size,
+                        max_size: self.inner.max_field_section_size,
+                    }));
+                }
+                Err(qpack::DecoderError::MissingRefs(required)) => {
+                    match self.inner.conn_state.poll_qpack_insert_count(required, cx) {
+                        Poll::Ready(Ok(())) => continue,
+                        Poll::Ready(Err(error)) => {
+                            return Poll::Ready(Err(StreamError::ConnectionError(
+                                convert_to_connection_error(error),
+                            )));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                Ok(decoded) => {
+                    if decoded.dyn_ref {
+                        self.inner.conn_state.queue_qpack_header_ack(stream_id);
+                    }
+                    return Poll::Ready(Ok(decoded));
+                }
+                Err(error) => {
+                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError {
+                            code: Code::QPACK_DECOMPRESSION_FAILED,
+                            message: format!("Failed to decode headers: {error}"),
+                        },
+                    )));
+                }
+            }
+        })
+        .await?;
 
         let qpack::Decoded { fields, .. } = decoded;
 

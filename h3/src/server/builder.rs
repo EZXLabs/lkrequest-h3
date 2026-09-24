@@ -129,7 +129,7 @@ impl Builder {
         B: Buf,
     {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let shared = SharedState::default();
+        let shared = SharedState::new(self.config.settings.qpack_max_table_capacity);
 
         Ok(Connection {
             inner: ConnectionInner::new(conn, Arc::new(shared), self.config.clone()).await?,

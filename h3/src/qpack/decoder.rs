@@ -80,14 +80,26 @@ pub struct Decoded {
 
 pub struct Decoder {
     table: DynamicTable,
+    max_table_capacity: usize,
 }
 
 impl Decoder {
+    pub fn new(max_table_capacity: usize) -> Self {
+        Self {
+            table: DynamicTable::new(),
+            max_table_capacity,
+        }
+    }
+
+    pub fn total_inserted(&self) -> usize {
+        self.table.total_inserted()
+    }
+
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
-        let (required_ref, base) = HeaderPrefix::decode(buf)?
-            .get(self.table.total_inserted(), self.table.max_mem_size())?;
+        let (required_ref, base) =
+            HeaderPrefix::decode(buf)?.get(self.table.total_inserted(), self.max_table_capacity)?;
 
         if required_ref > self.table.total_inserted() {
             return Err(DecoderError::MissingRefs(required_ref));
@@ -118,13 +130,23 @@ impl Decoder {
     ) -> Result<usize, DecoderError> {
         let inserted_on_start = self.table.total_inserted();
 
-        while let Some(instruction) = self.parse_instruction(read)? {
+        loop {
+            let instruction = match self.parse_instruction(read) {
+                Ok(Some(instruction)) => instruction,
+                Ok(None) | Err(DecoderError::UnexpectedEnd) => break,
+                Err(error) => return Err(error),
+            };
             #[cfg(feature = "tracing")]
             trace!("instruction {:?}", instruction);
 
             match instruction {
                 Instruction::Insert(field) => self.table.put(field)?,
                 Instruction::TableSizeUpdate(size) => {
+                    if size > self.max_table_capacity {
+                        return Err(DecoderError::DynamicTable(
+                            DynamicTableError::MaximumTableSizeTooLarge,
+                        ));
+                    }
                     self.table.set_max_size(size)?;
                 }
             }
@@ -264,7 +286,11 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
 #[cfg(test)]
 impl From<DynamicTable> for Decoder {
     fn from(table: DynamicTable) -> Self {
-        Self { table }
+        let max_table_capacity = table.max_mem_size();
+        Self {
+            table,
+            max_table_capacity,
+        }
     }
 }
 
@@ -357,6 +383,40 @@ mod tests {
         );
         let result = decode_stateless(&mut buf, 2);
         assert_eq!(result, Err(DecoderError::HeaderTooLong(44)));
+    }
+
+    #[test]
+    fn encoder_instruction_waits_for_the_rest_of_a_partial_chunk() {
+        let mut wire = Vec::new();
+        DynamicTableSizeUpdate(256).encode(&mut wire);
+        InsertWithoutNameRef::new("dynamic-name", "dynamic-value")
+            .encode(&mut wire)
+            .unwrap();
+
+        let mut decoder = Decoder::new(256);
+        let mut incoming = bytes::BytesMut::from(&wire[..wire.len() - 1]);
+        let mut outgoing = Vec::new();
+        assert_eq!(decoder.on_encoder_recv(&mut incoming, &mut outgoing), Ok(0));
+        assert_eq!(decoder.total_inserted(), 0);
+
+        incoming.extend_from_slice(&wire[wire.len() - 1..]);
+        assert_eq!(decoder.on_encoder_recv(&mut incoming, &mut outgoing), Ok(1));
+        assert_eq!(decoder.total_inserted(), 1);
+        assert!(incoming.is_empty());
+    }
+
+    #[test]
+    fn encoder_cannot_exceed_the_advertised_table_capacity() {
+        let mut wire = Vec::new();
+        DynamicTableSizeUpdate(64).encode(&mut wire);
+        let mut decoder = Decoder::new(32);
+
+        assert_eq!(
+            decoder.on_encoder_recv(&mut Cursor::new(wire), &mut Vec::new()),
+            Err(DecoderError::DynamicTable(
+                DynamicTableError::MaximumTableSizeTooLarge
+            ))
+        );
     }
 
     /**

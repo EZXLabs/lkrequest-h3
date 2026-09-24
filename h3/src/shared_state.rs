@@ -2,12 +2,33 @@
 
 use std::{
     borrow::Cow,
-    sync::{atomic::AtomicBool, OnceLock},
+    fmt,
+    sync::{atomic::AtomicBool, Mutex, OnceLock},
+    task::{Context, Poll, Waker},
 };
 
+use bytes::{Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
 
-use crate::{config::Settings, error::internal_error::ErrorOrigin};
+use crate::{
+    config::Settings,
+    error::internal_error::ErrorOrigin,
+    qpack::{self, Decoded, DecoderError},
+};
+
+struct QpackDecoderState {
+    decoder: qpack::Decoder,
+    pending_instructions: BytesMut,
+}
+
+impl fmt::Debug for QpackDecoderState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QpackDecoderState")
+            .field("total_inserted", &self.decoder.total_inserted())
+            .field("pending_instructions", &self.pending_instructions.len())
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
@@ -20,15 +41,136 @@ pub struct SharedState {
     closing: AtomicBool,
     /// Waker for the connection
     waker: AtomicWaker,
+    /// Stateful QPACK decoder shared by the connection driver and request streams.
+    qpack_decoder: Mutex<QpackDecoderState>,
+    /// Request streams waiting for encoder instructions that have not arrived yet.
+    qpack_waiters: Mutex<Vec<Waker>>,
 }
 
 impl Default for SharedState {
     fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl SharedState {
+    pub(crate) fn new(qpack_max_table_capacity: u64) -> Self {
         Self {
             settings: OnceLock::new(),
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
+            qpack_decoder: Mutex::new(QpackDecoderState {
+                decoder: qpack::Decoder::new(
+                    usize::try_from(qpack_max_table_capacity).unwrap_or(usize::MAX),
+                ),
+                pending_instructions: BytesMut::new(),
+            }),
+            qpack_waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn process_qpack_encoder(
+        &self,
+        incoming: &mut BytesMut,
+    ) -> Result<(), DecoderError> {
+        let (inserted_before, inserted_after) = {
+            let mut state = self
+                .qpack_decoder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let QpackDecoderState {
+                decoder,
+                pending_instructions,
+            } = &mut *state;
+            let inserted_before = decoder.total_inserted();
+            let inserted_after = decoder.on_encoder_recv(incoming, pending_instructions)?;
+            (inserted_before, inserted_after)
+        };
+        if inserted_after > inserted_before {
+            self.wake_qpack_waiters();
+            self.waker.wake();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_qpack(
+        &self,
+        encoded: &mut Bytes,
+        max_field_section_size: u64,
+    ) -> Result<Decoded, DecoderError> {
+        let state = self
+            .qpack_decoder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let decoded = state.decoder.decode_header(encoded)?;
+        if decoded.mem_size > max_field_section_size {
+            return Err(DecoderError::HeaderTooLong(decoded.mem_size));
+        }
+        Ok(decoded)
+    }
+
+    pub(crate) fn poll_qpack_insert_count(
+        &self,
+        required: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ErrorOrigin>> {
+        if let Some(error) = self.connection_error.get() {
+            return Poll::Ready(Err(error.clone()));
+        }
+
+        if self.qpack_total_inserted() >= required {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut waiters = self
+            .qpack_waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.qpack_total_inserted() >= required {
+            return Poll::Ready(Ok(()));
+        }
+        if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+
+    pub(crate) fn queue_qpack_header_ack(&self, stream_id: u64) {
+        let mut state = self
+            .qpack_decoder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        qpack::ack_header(stream_id, &mut state.pending_instructions);
+        self.waker.wake();
+    }
+
+    pub(crate) fn take_qpack_decoder_instructions(&self) -> Bytes {
+        self.qpack_decoder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending_instructions
+            .split()
+            .freeze()
+    }
+
+    fn qpack_total_inserted(&self) -> usize {
+        self.qpack_decoder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .decoder
+            .total_inserted()
+    }
+
+    fn wake_qpack_waiters(&self) {
+        let waiters = std::mem::take(
+            &mut *self
+                .qpack_waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for waker in waiters {
+            waker.wake();
         }
     }
 }
@@ -56,6 +198,7 @@ pub trait ConnectionState {
             .shared_state()
             .connection_error
             .get_or_init(move || error);
+        self.shared_state().wake_qpack_waiters();
         err.clone()
     }
 
