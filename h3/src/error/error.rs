@@ -152,6 +152,11 @@ pub enum StreamError {
 }
 
 impl StreamError {
+    /// Returns whether the peer's GOAWAY prevents further stream operations.
+    pub fn is_remote_closing(&self) -> bool {
+        matches!(self, Self::RemoteClosing)
+    }
+
     /// Returns the connection error responsible for terminating this stream.
     ///
     /// A reset of only this stream does not contain a connection error.
@@ -251,6 +256,21 @@ mod tests {
         let timeout = StreamError::ConnectionError(ConnectionError::Timeout);
         assert!(timeout.connection_error().is_some());
         assert!(timeout.connection_error().unwrap().remote_error().is_none());
+    }
+
+    #[test]
+    fn remote_closing_accessor_preserves_goaway_scope() {
+        assert!(StreamError::RemoteClosing.is_remote_closing());
+        assert!(!StreamError::RemoteTerminate {
+            code: Code::H3_REQUEST_CANCELLED,
+        }
+        .is_remote_closing());
+        assert!(!StreamError::ConnectionError(ConnectionError::Timeout).is_remote_closing());
+        assert!(!StreamError::HeaderTooBig {
+            actual_size: 2,
+            max_size: 1,
+        }
+        .is_remote_closing());
     }
 
     #[test]
