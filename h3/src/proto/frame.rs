@@ -346,6 +346,10 @@ macro_rules! frame_types {
     {$($name:ident = $val:expr,)*} => {
         impl FrameType {
             $(pub const $name: FrameType = FrameType($val);)*
+
+            pub(crate) fn is_known(self) -> bool {
+                matches!(self, $(Self::$name)|*)
+            }
         }
     }
 }
@@ -379,8 +383,11 @@ impl FrameType {
 pub struct FrameType(u64);
 
 impl FrameType {
-    fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
+    pub(crate) fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
         Ok(FrameType(buf.get_var()?))
+    }
+    pub(crate) fn value(self) -> u64 {
+        self.0
     }
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
         buf.write_var(self.0);

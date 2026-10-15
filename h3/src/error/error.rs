@@ -36,6 +36,16 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
+    /// Returns the underlying QUIC/backend error when this is a remote error.
+    ///
+    /// Local HTTP/3 errors and timeouts do not contain this source.
+    pub fn remote_error(&self) -> Option<&ConnectionErrorIncoming> {
+        match self {
+            Self::Remote(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// Returns if the error is H3_NO_ERROR local or remote
     pub fn is_h3_no_error(&self) -> bool {
         match self {
@@ -142,6 +152,16 @@ pub enum StreamError {
 }
 
 impl StreamError {
+    /// Returns the connection error responsible for terminating this stream.
+    ///
+    /// A reset of only this stream does not contain a connection error.
+    pub fn connection_error(&self) -> Option<&ConnectionError> {
+        match self {
+            Self::ConnectionError(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// Returns if the error is H3_NO_ERROR
     pub fn is_h3_no_error(&self) -> bool {
         match self {
@@ -202,3 +222,53 @@ impl std::fmt::Display for StreamError {
 }
 
 impl std::error::Error for StreamError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_error_accessors_preserve_backend_cause_and_stream_scope() {
+        let source = std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "backend source",
+        ));
+        let error = StreamError::ConnectionError(ConnectionError::Remote(
+            ConnectionErrorIncoming::Undefined(source.clone()),
+        ));
+        let connection = error.connection_error().unwrap();
+        let ConnectionErrorIncoming::Undefined(cause) = connection.remote_error().unwrap() else {
+            panic!("backend cause type was not preserved");
+        };
+        let io = cause.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(std::ptr::eq(io, source.as_ref()));
+
+        let stream_reset = StreamError::RemoteTerminate {
+            code: Code::H3_REQUEST_CANCELLED,
+        };
+        assert!(stream_reset.connection_error().is_none());
+        let timeout = StreamError::ConnectionError(ConnectionError::Timeout);
+        assert!(timeout.connection_error().is_some());
+        assert!(timeout.connection_error().unwrap().remote_error().is_none());
+    }
+
+    #[test]
+    fn typed_error_accessors_distinguish_application_close_from_local_protocol_error() {
+        let remote = ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose {
+            error_code: 0x102,
+        });
+        assert!(matches!(
+            remote.remote_error(),
+            Some(ConnectionErrorIncoming::ApplicationClose { error_code: 0x102 })
+        ));
+        let local = ConnectionError::Local {
+            error: LocalError::Application {
+                code: Code::H3_FRAME_ERROR,
+                reason: "invalid frame".into(),
+            },
+        };
+        assert!(local.remote_error().is_none());
+        assert!(!local.is_h3_no_error());
+    }
+}

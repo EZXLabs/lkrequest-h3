@@ -500,6 +500,15 @@ impl<B, S: RecvStream> BufRecvStream<S, B> {
     }
 }
 
+impl<S: quic::RecvStreamReset, B> quic::RecvStreamReset for BufRecvStream<S, B> {
+    fn poll_received_reset(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.stream.poll_received_reset(cx)
+    }
+}
+
 impl<S: RecvStream, B> RecvStream for BufRecvStream<S, B> {
     type Buf = Bytes;
 

@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::future;
 use http::request;
 
@@ -21,7 +21,7 @@ use crate::{
         ConnectionError, StreamError,
     },
     frame::FrameStream,
-    proto::{frame::Frame, headers::Header, push::PushId},
+    proto::{frame::Frame, headers::Header, push::PushId, varint::VarInt},
     qpack,
     quic::{self, StreamId},
     shared_state::{ConnectionState, SharedState},
@@ -120,6 +120,8 @@ where
     pub(super) _buf: PhantomData<fn(B)>,
     pub(super) send_grease_frame: bool,
     pub(super) pseudo_header_order: Option<Vec<PseudoHeader>>,
+    pub(super) accept_truncated_response_payloads: bool,
+    pub(super) wait_for_incomplete_response_frame_headers: bool,
 }
 
 impl<T, B> ConnectionState for SendRequest<T, B>
@@ -149,6 +151,27 @@ where
     pub async fn send_request(
         &mut self,
         req: http::Request<()>,
+    ) -> Result<RequestStream<T::BidiStream, B>, StreamError> {
+        self.send_request_inner(req, None).await
+    }
+
+    /// Send a request with an initial RFC 9218 control-stream priority update.
+    ///
+    /// The update targets the actual allocated request stream and is flushed
+    /// before HEADERS. Concurrent clones share one ordered control writer.
+    /// The connection driver must be polled, as it performs the control write.
+    pub async fn send_request_with_priority(
+        &mut self,
+        req: http::Request<()>,
+        field_value: Vec<u8>,
+    ) -> Result<RequestStream<T::BidiStream, B>, StreamError> {
+        self.send_request_inner(req, Some(field_value)).await
+    }
+
+    async fn send_request_inner(
+        &mut self,
+        req: http::Request<()>,
+        priority: Option<Vec<u8>>,
     ) -> Result<RequestStream<T::BidiStream, B>, StreamError> {
         if let Some(error) = self.check_peer_connection_closing() {
             return Err(error);
@@ -219,13 +242,30 @@ where
             });
         }
 
+        if let Some(field_value) = priority {
+            let id = quic::SendStream::send_id(&stream);
+            let flushed = self
+                .conn_state
+                .queue_priority_update(VarInt::from(id).into_inner(), Bytes::from(field_value));
+            flushed.await.map_err(|_| {
+                self.handle_connection_error_on_stream(InternalConnectionError::new(
+                    Code::H3_CLOSED_CRITICAL_STREAM,
+                    "control writer stopped before priority update was flushed".into(),
+                ))
+            })?;
+        }
+
         stream::write(&mut stream, Frame::Headers(block.freeze()))
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;
 
         let request_stream = RequestStream {
             inner: connection::RequestStream::new(
-                FrameStream::new(BufRecvStream::new(stream)),
+                FrameStream::new(BufRecvStream::new(stream))
+                    .accept_truncated_response_payloads(self.accept_truncated_response_payloads)
+                    .wait_for_incomplete_response_frame_headers(
+                        self.wait_for_incomplete_response_frame_headers,
+                    ),
                 self.max_field_section_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,
@@ -254,6 +294,9 @@ where
             _buf: PhantomData,
             send_grease_frame: self.send_grease_frame,
             pseudo_header_order: self.pseudo_header_order.clone(),
+            accept_truncated_response_payloads: self.accept_truncated_response_payloads,
+            wait_for_incomplete_response_frame_headers: self
+                .wait_for_incomplete_response_frame_headers,
         }
     }
 }
@@ -411,6 +454,9 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
+        if let Err(error) = self.inner.poll_priority_updates(cx) {
+            return Poll::Ready(error);
+        }
         if let Err(error) = self.inner.poll_qpack(cx) {
             return Poll::Ready(error);
         }

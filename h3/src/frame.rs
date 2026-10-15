@@ -25,6 +25,8 @@ pub struct FrameStream<S, B> {
     // Already read data from the stream
     decoder: FrameDecoder,
     remaining_data: usize,
+    reading_data_frame: bool,
+    wait_for_incomplete_response_frame_headers: bool,
 }
 
 impl<S, B> FrameStream<S, B> {
@@ -33,7 +35,19 @@ impl<S, B> FrameStream<S, B> {
             stream,
             decoder: FrameDecoder::default(),
             remaining_data: 0,
+            reading_data_frame: false,
+            wait_for_incomplete_response_frame_headers: false,
         }
+    }
+
+    pub(crate) fn accept_truncated_response_payloads(mut self, enabled: bool) -> Self {
+        self.decoder.accept_truncated_response_payloads = enabled;
+        self
+    }
+
+    pub(crate) fn wait_for_incomplete_response_frame_headers(mut self, enabled: bool) -> Self {
+        self.wait_for_incomplete_response_frame_headers = enabled;
+        self
     }
 
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
@@ -64,19 +78,39 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
+        self.poll_next_with_eof_context(cx, true)
+    }
+
+    pub(crate) fn poll_next_after_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
+        self.poll_next_with_eof_context(cx, false)
+    }
+
+    fn poll_next_with_eof_context(
+        &mut self,
+        cx: &mut Context<'_>,
+        allow_headers: bool,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
         assert!(
             self.remaining_data == 0,
             "There is still data to read, please call poll_data() until it returns None."
         );
 
         loop {
-            match self.decoder.decode(self.stream.buf_mut())? {
+            match self
+                .decoder
+                .decode_with_context(self.stream.buf_mut(), allow_headers)?
+            {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
+                    self.reading_data_frame = true;
                     return Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))));
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
                     self.remaining_data = usize::MAX;
+                    self.reading_data_frame = false;
                     return Poll::Ready(Ok(frame));
                 }
                 Some(frame) => return Poll::Ready(Ok(Some(frame))),
@@ -89,6 +123,23 @@ where
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(true) => {
                     if self.stream.buf_mut().has_remaining() {
+                        if self.decoder.accept_truncated_response_payloads {
+                            if let Some(ty) =
+                                FrameDecoder::incomplete_payload_type(self.stream.buf())
+                            {
+                                if !ty.is_known()
+                                    || (allow_headers && ty == frame::FrameType::HEADERS)
+                                {
+                                    let buffered = self.stream.buf_mut();
+                                    buffered.advance(buffered.remaining());
+                                    self.decoder.expected = None;
+                                    return Poll::Ready(Ok(None));
+                                }
+                                return Poll::Ready(Err(FrameStreamError::Proto(
+                                    FrameProtocolError::ForbiddenFrame(ty.value()),
+                                )));
+                            }
+                        }
                         // Reached the end of receive stream, but there is still some data:
                         // The frame is incomplete.
                         return Poll::Ready(Err(FrameStreamError::UnexpectedEnd));
@@ -120,11 +171,16 @@ where
         let data = self.stream.buf_mut().take_chunk(self.remaining_data);
 
         match (data, end) {
-            (None, true) => Poll::Ready(Ok(None)),
+            (None, true) => {
+                self.remaining_data = 0;
+                Poll::Ready(Ok(None))
+            }
             (None, false) => Poll::Pending,
             (Some(d), true)
                 if d.remaining() < self.remaining_data
-                    && !self.stream.buf_mut().has_remaining() =>
+                    && !self.stream.buf_mut().has_remaining()
+                    && !(self.decoder.accept_truncated_response_payloads
+                        && self.reading_data_frame) =>
             {
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             }
@@ -146,6 +202,12 @@ where
 
     pub(crate) fn is_eos(&self) -> bool {
         self.stream.is_eos() && !self.stream.buf().has_remaining()
+    }
+
+    pub(crate) fn waits_for_incomplete_header(&self) -> bool {
+        self.wait_for_incomplete_response_frame_headers
+            && self.stream.is_eos()
+            && FrameDecoder::incomplete_header(self.stream.buf())
     }
 
     fn try_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, FrameStreamError>> {
@@ -202,11 +264,16 @@ where
                 stream: send,
                 decoder: FrameDecoder::default(),
                 remaining_data: 0,
+                reading_data_frame: false,
+                wait_for_incomplete_response_frame_headers: false,
             },
             FrameStream {
                 stream: recv,
                 decoder: self.decoder,
                 remaining_data: self.remaining_data,
+                reading_data_frame: self.reading_data_frame,
+                wait_for_incomplete_response_frame_headers: self
+                    .wait_for_incomplete_response_frame_headers,
             },
         )
     }
@@ -215,18 +282,71 @@ where
 #[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    accept_truncated_response_payloads: bool,
 }
 
 impl FrameDecoder {
+    fn incomplete_header<B: Buf>(src: &BufList<B>) -> bool {
+        let mut cursor = src.cursor();
+        if !cursor.has_remaining() {
+            return false;
+        }
+        match frame::FrameType::decode(&mut cursor) {
+            Err(_) => true,
+            Ok(ty) if ty == frame::FrameType::WEBTRANSPORT_BI_STREAM => false,
+            Ok(_) => crate::proto::varint::VarInt::decode(&mut cursor).is_err(),
+        }
+    }
+
+    fn frame_header<B: Buf>(src: &BufList<B>) -> Option<(frame::FrameType, u64, usize)> {
+        let mut cursor = src.cursor();
+        let ty = frame::FrameType::decode(&mut cursor).ok()?;
+        if ty == frame::FrameType::WEBTRANSPORT_BI_STREAM {
+            return None;
+        }
+        let length = crate::proto::varint::VarInt::decode(&mut cursor)
+            .ok()?
+            .into_inner();
+        Some((ty, length, cursor.remaining()))
+    }
+
+    fn incomplete_payload_type<B: Buf>(src: &BufList<B>) -> Option<frame::FrameType> {
+        let (ty, length, available) = Self::frame_header(src)?;
+        (length > available as u64).then_some(ty)
+    }
+
+    #[cfg(test)]
     fn decode<B: Buf>(
         &mut self,
         src: &mut BufList<B>,
+    ) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
+        self.decode_with_context(src, true)
+    }
+
+    fn decode_with_context<B: Buf>(
+        &mut self,
+        src: &mut BufList<B>,
+        allow_headers: bool,
     ) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
             if !src.has_remaining() {
                 return Ok(None);
+            }
+
+            if self.accept_truncated_response_payloads {
+                if let Some((ty, _, _)) = Self::frame_header(src) {
+                    let allowed_known = ty == frame::FrameType::DATA
+                        || (allow_headers && ty == frame::FrameType::HEADERS);
+                    // Chrome recognizes ORIGIN and ACCEPT_CH even though this backend
+                    // does not implement those control-frame extensions.
+                    if (ty.is_known() && !allowed_known) || matches!(ty.value(), 0x0c | 0x89) {
+                        return Err(FrameStreamError::Proto(FrameProtocolError::ForbiddenFrame(
+                            ty.value(),
+                        )));
+                    }
+                }
             }
 
             if let Some(min) = self.expected {
@@ -401,6 +521,51 @@ mod tests {
 
     // FrameStream
 
+    #[test]
+    fn incomplete_header_classification_excludes_payloads_and_webtransport() {
+        for bytes in [
+            &b"\x40"[..],
+            &b"\x01"[..],
+            &b"\x01\x40"[..],
+            &b"\x40\x42\x80\x00"[..],
+        ] {
+            assert!(
+                FrameDecoder::incomplete_header(&BufList::from(Bytes::copy_from_slice(bytes))),
+                "{bytes:?}"
+            );
+        }
+        for bytes in [
+            &b"\x01\x05abc"[..],
+            &b"\x21\x05abc"[..],
+            &b"\x00\x05abc"[..],
+            &b"\x40\x41"[..],
+        ] {
+            assert!(
+                !FrameDecoder::incomplete_header(&BufList::from(Bytes::copy_from_slice(bytes))),
+                "{bytes:?}"
+            );
+        }
+        assert!(!FrameDecoder::incomplete_header(&BufList::<Bytes>::new()));
+    }
+
+    #[tokio::test]
+    async fn incomplete_header_wait_classification_requires_opt_in_and_fin() {
+        for enabled in [false, true] {
+            for bytes in [&b"\x40"[..], &b"\x01\x40"[..]] {
+                let mut recv = FakeRecv::default();
+                recv.chunk(Bytes::copy_from_slice(bytes));
+                let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv))
+                    .wait_for_incomplete_response_frame_headers(enabled);
+                assert!(!stream.waits_for_incomplete_header());
+                assert_matches!(
+                    poll_fn(|cx| stream.poll_next(cx)).await,
+                    Err(FrameStreamError::UnexpectedEnd)
+                );
+                assert_eq!(stream.waits_for_incomplete_header(), enabled);
+            }
+        }
+    }
+
     macro_rules! assert_poll_matches {
         ($poll_fn:expr, $match:pat) => {
             assert_matches!(
@@ -571,6 +736,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_payload_eof_keeps_partial_data() {
+        let mut recv = FakeRecv::default();
+        recv.chunk(Bytes::from_static(b"\x00\x05abc"));
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::Data(PayloadLen(5))))
+        );
+        assert_poll_matches!(|cx| to_bytes(stream.poll_data(cx)), Ok(Some(bytes)) if bytes == b"abc".as_slice());
+        assert_poll_matches!(|cx| to_bytes(stream.poll_data(cx)), Ok(None));
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn response_payload_eof_accepts_headers_and_unknown_payloads() {
+        for bytes in [
+            b"\x01\x05ab".as_slice(),
+            b"\x21\x05x".as_slice(),
+            b"\x01\x05".as_slice(),
+        ] {
+            let mut recv = FakeRecv::default();
+            recv.chunk(Bytes::copy_from_slice(bytes));
+            let mut stream: FrameStream<_, ()> =
+                FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+            assert_poll_matches!(|cx| stream.poll_next(cx), Ok(None));
+            assert_poll_matches!(|cx| stream.poll_next(cx), Ok(None));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_payload_eof_preserves_incomplete_header_errors() {
+        for bytes in [b"\x40".as_slice(), b"\x00\x40".as_slice()] {
+            let mut recv = FakeRecv::default();
+            recv.chunk(Bytes::copy_from_slice(bytes));
+            let mut stream: FrameStream<_, ()> =
+                FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+            assert_poll_matches!(
+                |cx| stream.poll_next(cx),
+                Err(FrameStreamError::UnexpectedEnd)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_payload_eof_preserves_trailer_and_control_ordering() {
+        for (bytes, ty, after_trailers) in [
+            (b"\x01\x05x".as_slice(), 1, true),
+            (b"\x04\x05x".as_slice(), 4, false),
+            (b"\x06\x05x".as_slice(), 6, false),
+        ] {
+            let mut recv = FakeRecv::default();
+            recv.chunk(Bytes::copy_from_slice(bytes));
+            let mut stream: FrameStream<_, ()> =
+                FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+            let result = poll_fn(|cx| {
+                if after_trailers {
+                    stream.poll_next_after_trailers(cx)
+                } else {
+                    stream.poll_next(cx)
+                }
+            })
+            .await;
+            assert_matches!(result, Err(FrameStreamError::Proto(FrameProtocolError::ForbiddenFrame(value))) if value == ty);
+        }
+        let mut recv = FakeRecv::default();
+        recv.chunk(Bytes::from_static(b"\x21\x05x"));
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+        assert_poll_matches!(|cx| stream.poll_next_after_trailers(cx), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn response_payload_eof_preserves_complete_invalid_frame_payload() {
+        let mut recv = FakeRecv::default();
+        recv.chunk(Bytes::from_static(b"\x01\x03\x00\x00\xff"));
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(payload))) if payload == b"\x00\x00\xff".as_slice());
+    }
+
+    #[tokio::test]
+    async fn response_payload_eof_does_not_change_webtransport() {
+        let mut recv = FakeRecv::default();
+        recv.chunk(Bytes::from_static(b"\x40\x41\x00abc"));
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::WebTransportStream(_)))
+        );
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Err(FrameStreamError::UnexpectedEnd)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_control_headers_reject_without_waiting_for_fin() {
+        for (bytes, ty) in [
+            (b"\x04\x05x".as_slice(), 4),
+            (b"\x06\x05x".as_slice(), 6),
+            (b"\x0c\x05x".as_slice(), 12),
+            (b"\x0c\x01x".as_slice(), 12),
+            (b"\x40\x89\x05x".as_slice(), 137),
+            (b"\x40\x89\x01x".as_slice(), 137),
+            (b"\x21\x00\x40\x89\x05x".as_slice(), 137),
+        ] {
+            let mut recv = FakeRecv::default();
+            recv.chunk(Bytes::copy_from_slice(bytes));
+            let polls = recv.poll_count.clone();
+            let mut stream: FrameStream<_, ()> =
+                FrameStream::new(BufRecvStream::new(recv)).accept_truncated_response_payloads(true);
+            assert_poll_matches!(|cx| stream.poll_next(cx), Err(FrameStreamError::Proto(FrameProtocolError::ForbiddenFrame(value))) if value == ty);
+            assert_eq!(polls.get(), 1, "the forbidden frame header must suffice");
+        }
+    }
+
+    #[tokio::test]
     async fn poll_data_ignores_unknown_frames() {
         use crate::proto::varint::BufMutExt as _;
 
@@ -634,12 +918,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn poll_data_delayed_fin_allows_completion() {
+        let mut recv = FakeRecv {
+            pending_at: Some(2),
+            ..FakeRecv::default()
+        };
+        let mut buf = BytesMut::new();
+        FrameType::DATA.encode(&mut buf);
+        VarInt::from(5u32).encode(&mut buf);
+        buf.put_slice(b"abc");
+        recv.chunk(buf.freeze());
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::Data(PayloadLen(5))))
+        );
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Ok(Some(bytes)) if &*bytes == b"abc"
+        );
+        assert_poll_matches!(|cx| to_bytes(stream.poll_data(cx)), Ok(None));
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn poll_data_webtransport_fin_allows_completion() {
+        for fragmented in [true, false] {
+            let mut recv = FakeRecv::default();
+            let mut buf = BytesMut::new();
+            FrameType::WEBTRANSPORT_BI_STREAM.encode(&mut buf);
+            VarInt::from(0u32).encode(&mut buf);
+            recv.chunk(buf.freeze());
+            if fragmented {
+                recv.chunk(Bytes::from_static(b"abc"));
+                recv.chunk(Bytes::from_static(b"de"));
+            }
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+            assert_poll_matches!(
+                |cx| stream.poll_next(cx),
+                Ok(Some(Frame::WebTransportStream(_)))
+            );
+            if fragmented {
+                assert_poll_matches!(
+                    |cx| to_bytes(stream.poll_data(cx)),
+                    Ok(Some(bytes)) if &*bytes == b"abc"
+                );
+                assert_poll_matches!(
+                    |cx| to_bytes(stream.poll_data(cx)),
+                    Ok(Some(bytes)) if &*bytes == b"de"
+                );
+            }
+            assert_poll_matches!(|cx| to_bytes(stream.poll_data(cx)), Ok(None));
+            assert_poll_matches!(|cx| stream.poll_next(cx), Ok(None));
+        }
+    }
+
     // Helpers
 
     #[derive(Default)]
     struct FakeRecv {
         chunks: VecDeque<Bytes>,
         poll_count: Rc<Cell<usize>>,
+        pending_at: Option<usize>,
     }
 
     impl FakeRecv {
@@ -654,9 +997,13 @@ mod tests {
 
         fn poll_data(
             &mut self,
-            _: &mut Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
             self.poll_count.set(self.poll_count.get() + 1);
+            if self.pending_at == Some(self.poll_count.get()) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(self.chunks.pop_front()))
         }
 

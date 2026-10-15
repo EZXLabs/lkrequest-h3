@@ -11,6 +11,7 @@ mod h3_quinn;
 
 mod connection;
 mod grease;
+mod lazy_qpack_prefix;
 mod request;
 
 use std::{

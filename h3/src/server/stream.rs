@@ -87,7 +87,16 @@ where
     /// Receive an optional set of trailers for the request
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        future::poll_fn(|cx| self.poll_recv_trailers(cx)).await
+        let mut registration = self.inner.take_close_waiter();
+        let mut qpack_registration = self.inner.take_qpack_waiter();
+        future::poll_fn(|cx| {
+            self.inner.poll_recv_trailers_with_waiter(
+                cx,
+                &mut registration,
+                &mut qpack_registration,
+            )
+        })
+        .await
     }
 
     /// Poll for an optional set of trailers for the request
@@ -102,7 +111,7 @@ where
     /// Tell the peer to stop sending into the underlying QUIC stream
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        self.inner.stream.stop_sending(error_code)
+        self.inner.stop_sending(error_code)
     }
 
     /// Returns the underlying stream id
@@ -265,6 +274,108 @@ impl Drop for RequestEnd {
                 "failed to notify connection of request end: {} {}",
                 self.stream_id, _error
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod qpack_cancellation_tests {
+    use super::*;
+    use crate::{frame::FrameStream, stream::BufRecvStream};
+    use bytes::Bytes;
+    use std::future::Future;
+
+    struct FinishedRecv(Option<Bytes>);
+    impl quic::RecvStream for FinishedRecv {
+        type Buf = Bytes;
+        fn poll_data(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Option<Bytes>, quic::StreamErrorIncoming>> {
+            Poll::Ready(Ok(self.0.take()))
+        }
+        fn stop_sending(&mut self, _: u64) {}
+        fn recv_id(&self) -> StreamId {
+            StreamId::try_from(0).unwrap()
+        }
+    }
+
+    fn blocked_trailers() -> (RequestStream<FinishedRecv, Bytes>, Arc<SharedState>, Bytes) {
+        let state = Arc::new(SharedState::new(4096));
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-dynamic", "retained".parse().unwrap());
+        let (block, instructions) = qpack::encode_dynamic_for_test(0, Header::trailer(trailers));
+        let mut wire = BytesMut::new();
+        Frame::<Bytes>::Headers(block).encode_with_payload(&mut wire);
+        let (request_end, _) = tokio::sync::mpsc::unbounded_channel();
+        let stream = RequestStream {
+            inner: crate::connection::RequestStream::new(
+                FrameStream::new(BufRecvStream::new(FinishedRecv(Some(wire.freeze())))),
+                u64::MAX,
+                state.clone(),
+                false,
+            ),
+            request_end: Arc::new(RequestEnd {
+                request_end,
+                stream_id: StreamId::try_from(0).unwrap(),
+            }),
+        };
+        (stream, state, instructions)
+    }
+
+    #[tokio::test]
+    async fn qpack_server_cancelled_trailers_release_waiter_and_resume_once() {
+        let (mut stream, state, instructions) = blocked_trailers();
+        for _ in 0..2 {
+            let mut read = Box::pin(stream.recv_trailers());
+            assert!(read
+                .as_mut()
+                .poll(&mut Context::from_waker(
+                    futures_util::task::noop_waker_ref()
+                ))
+                .is_pending());
+            assert_eq!(state.qpack_waiter_count(), 1);
+            drop(read);
+            assert_eq!(state.qpack_waiter_count(), 0);
+            assert!(stream.inner.trailers.is_some());
+        }
+        state
+            .process_qpack_encoder(&mut BytesMut::from(instructions.as_ref()))
+            .unwrap();
+        assert_eq!(state.take_qpack_decoder_instructions().as_ref(), b"\x01");
+        assert_eq!(
+            stream.recv_trailers().await.unwrap().unwrap()["x-dynamic"],
+            "retained"
+        );
+        assert_eq!(state.take_qpack_decoder_instructions().as_ref(), b"\x80");
+        assert!(stream.recv_trailers().await.unwrap().is_none());
+        assert!(state.take_qpack_decoder_instructions().is_empty());
+    }
+
+    #[test]
+    fn qpack_server_raw_trailer_stop_and_error_unregister_waiter() {
+        for stop in [false, true] {
+            let (mut stream, state, _) = blocked_trailers();
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(stream.poll_recv_trailers(&mut cx).is_pending());
+            assert_eq!(state.qpack_waiter_count(), 1);
+            if stop {
+                stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            } else {
+                state.set_conn_error(
+                    InternalConnectionError::new(
+                        Code::H3_INTERNAL_ERROR,
+                        "closed while decoding trailers".to_string(),
+                    )
+                    .into(),
+                );
+                assert!(matches!(
+                    stream.poll_recv_trailers(&mut cx),
+                    Poll::Ready(Err(StreamError::ConnectionError(_)))
+                ));
+            }
+            assert_eq!(state.qpack_waiter_count(), 0);
+            assert!(state.take_qpack_decoder_instructions().is_empty());
         }
     }
 }

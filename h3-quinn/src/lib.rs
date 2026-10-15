@@ -25,7 +25,6 @@ use h3::{
     error::Code,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-use tokio_util::sync::ReusableBoxFuture;
 
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -126,27 +125,6 @@ fn convert_connection_error(e: quinn::ConnectionError) -> h3::quic::ConnectionEr
         | error @ quinn::ConnectionError::TransportError(_) => {
             ConnectionErrorIncoming::Undefined(Arc::new(error))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::convert_connection_error;
-    use h3::quic::ConnectionErrorIncoming;
-    use quinn::{ConnectionClose, ConnectionError, TransportErrorCode};
-
-    #[test]
-    fn connection_closed_is_mapped_to_structured_variant() {
-        let error = ConnectionError::ConnectionClosed(ConnectionClose {
-            error_code: TransportErrorCode::NO_ERROR,
-            frame_type: None,
-            reason: Default::default(),
-        });
-
-        assert!(matches!(
-            convert_connection_error(error),
-            ConnectionErrorIncoming::ConnectionClosed { error_code: 0 }
-        ));
     }
 }
 
@@ -326,6 +304,15 @@ impl<B: Buf> quic::RecvStream for BidiStream<B> {
     }
 }
 
+impl<B: Buf> quic::RecvStreamReset for BidiStream<B> {
+    fn poll_received_reset(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        quic::RecvStreamReset::poll_received_reset(&mut self.recv, cx)
+    }
+}
+
 impl<B> quic::SendStream<B> for BidiStream<B>
 where
     B: Buf,
@@ -376,20 +363,11 @@ where
 ///
 /// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
 pub struct RecvStream {
-    stream: Option<quinn::RecvStream>,
-    read_chunk_fut: ReadChunkFuture,
+    stream: quinn::RecvStream,
     id: StreamId,
     is_0rtt: bool,
-    pending_stop: Option<VarInt>,
+    observed_reset: Option<u64>,
 }
-
-type ReadChunkFuture = ReusableBoxFuture<
-    'static,
-    (
-        quinn::RecvStream,
-        Result<Option<quinn::Chunk>, quinn::ReadError>,
-    ),
->;
 
 impl RecvStream {
     fn new(stream: quinn::RecvStream) -> Self {
@@ -398,12 +376,10 @@ impl RecvStream {
             .expect("invalid stream id");
         let is_0rtt = stream.is_0rtt();
         Self {
-            stream: Some(stream),
-            // Should only allocate once the first time it's used
-            read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
+            stream,
             id,
             is_0rtt,
-            pending_stop: None,
+            observed_reset: None,
         }
     }
 }
@@ -416,18 +392,11 @@ impl quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        if let Some(mut stream) = self.stream.take() {
-            self.read_chunk_fut.set(async move {
-                let chunk = stream.read_chunk(usize::MAX, true).await;
-                (stream, chunk)
-            })
-        };
-
-        let (mut stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
-        if let Some(error_code) = self.pending_stop.take() {
-            let _ = stream.stop(error_code);
+        if let Some(error_code) = self.observed_reset {
+            return Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code }));
         }
-        self.stream = Some(stream);
+        // read_chunk is cancel-safe; keep ownership here so STOP can act while reads are pending.
+        let chunk = ready!(std::pin::pin!(self.stream.read_chunk(usize::MAX, true)).poll(cx));
         Poll::Ready(Ok(chunk
             .map_err(convert_read_error_to_stream_error)?
             .map(|c| c.bytes)))
@@ -436,16 +405,30 @@ impl quic::RecvStream for RecvStream {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn stop_sending(&mut self, error_code: u64) {
         let error_code = VarInt::from_u64(error_code).expect("invalid error_code");
-        if let Some(stream) = self.stream.as_mut() {
-            let _ = stream.stop(error_code);
-        } else {
-            self.pending_stop = Some(error_code);
-        }
+        let _ = self.stream.stop(error_code);
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn recv_id(&self) -> StreamId {
         self.id
+    }
+}
+
+impl quic::RecvStreamReset for RecvStream {
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn poll_received_reset(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        if let Some(error_code) = self.observed_reset {
+            return Poll::Ready(Ok(Some(error_code)));
+        }
+        let reset = ready!(std::pin::pin!(self.stream.received_reset()).poll(cx))
+            .map_err(|error| convert_read_error_to_stream_error(error.into()))?;
+        // Quinn releases its receive state when the reset is observed. Preserve
+        // the code for repeated observations and subsequent normal reads.
+        self.observed_reset = reset.map(VarInt::into_inner);
+        Poll::Ready(Ok(self.observed_reset))
     }
 }
 
@@ -599,5 +582,38 @@ where
             }
             Err(err) => Poll::Ready(Err(convert_write_error_to_stream_error(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{convert_connection_error, convert_read_error_to_stream_error};
+    use h3::quic::{ConnectionErrorIncoming, StreamErrorIncoming};
+    use quinn::{ConnectionClose, ConnectionError, TransportErrorCode};
+
+    #[test]
+    fn connection_closed_is_mapped_to_structured_variant() {
+        let error = ConnectionError::ConnectionClosed(ConnectionClose {
+            error_code: TransportErrorCode::NO_ERROR,
+            frame_type: None,
+            reason: Default::default(),
+        });
+
+        assert!(matches!(
+            convert_connection_error(error),
+            ConnectionErrorIncoming::ConnectionClosed { error_code: 0 }
+        ));
+    }
+
+    #[test]
+    fn reset_observer_zero_rtt_rejection_preserves_read_error_type() {
+        let mapped = convert_read_error_to_stream_error(quinn::ResetError::ZeroRttRejected.into());
+        let StreamErrorIncoming::Unknown(error) = mapped else {
+            panic!("0-RTT rejection must retain the normal read-error mapping");
+        };
+        assert!(matches!(
+            error.downcast_ref::<quinn::ReadError>(),
+            Some(quinn::ReadError::ZeroRttRejected)
+        ));
     }
 }

@@ -24,6 +24,7 @@ use crate::{
     },
     frame::{FrameStream, FrameStreamError},
     proto::{
+        coding::Encode,
         frame::{self, Frame, PayloadLen},
         headers::Header,
         stream::StreamType,
@@ -31,7 +32,9 @@ use crate::{
     },
     qpack,
     quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming},
-    shared_state::{ConnectionState, SharedState},
+    shared_state::{
+        ConnectionCloseWaiter, ConnectionState, PendingPriorityUpdate, QpackWaiter, SharedState,
+    },
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
     webtransport::SessionId,
 };
@@ -83,6 +86,12 @@ where
     qpack_streams: QpackStreams<C, B>,
     qpack_encoder_buf: BytesMut,
     qpack_decoder_send_buf: BytesMut,
+    qpack_decoder_pending_prefix: Option<StreamType>,
+    #[cfg(test)]
+    qpack_encoder_send_buf: BytesMut,
+    #[cfg(test)]
+    qpack_encoder_pending_prefix: Option<StreamType>,
+    pending_priority_update: Option<(PendingPriorityUpdate, bool)>,
     /// Buffers incoming uni/recv streams which have yet to be claimed.
     ///
     /// This is opposed to discarding them by returning in `poll_accept_recv`, which may cause them to be missed by something else polling.
@@ -141,6 +150,20 @@ where
     Finished,
 }
 
+fn queue_qpack_instructions(
+    buffer: &mut BytesMut,
+    pending_prefix: &mut Option<StreamType>,
+    instructions: &[u8],
+) {
+    if instructions.is_empty() {
+        return;
+    }
+    if let Some(prefix) = pending_prefix.take() {
+        prefix.encode(buffer);
+    }
+    buffer.extend_from_slice(instructions);
+}
+
 impl<B, C> ConnectionInner<C, B>
 where
     C: quic::Connection<B>,
@@ -194,6 +217,7 @@ where
 
         let mut decoder_send = Option::take(&mut self.qpack_streams.decoder_send);
         let mut encoder_send = Option::take(&mut self.qpack_streams.encoder_send);
+        let defer_prefixes = self.config.defer_qpack_stream_prefixes;
 
         let (control, ..) = future::join3(
             stream::write(
@@ -201,12 +225,12 @@ where
                 WriteBuf::from(UniStreamHeader::Control(settings)),
             ),
             async {
-                if let Some(stream) = &mut decoder_send {
+                if let Some(stream) = decoder_send.as_mut().filter(|_| !defer_prefixes) {
                     let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Decoder)).await;
                 }
             },
             async {
-                if let Some(stream) = &mut encoder_send {
+                if let Some(stream) = encoder_send.as_mut().filter(|_| !defer_prefixes) {
                     let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Encoder)).await;
                 }
             },
@@ -349,6 +373,16 @@ where
             qpack_streams,
             qpack_encoder_buf: BytesMut::new(),
             qpack_decoder_send_buf: BytesMut::new(),
+            qpack_decoder_pending_prefix: config
+                .defer_qpack_stream_prefixes
+                .then_some(StreamType::DECODER),
+            #[cfg(test)]
+            qpack_encoder_send_buf: BytesMut::new(),
+            #[cfg(test)]
+            qpack_encoder_pending_prefix: config
+                .defer_qpack_stream_prefixes
+                .then_some(StreamType::ENCODER),
+            pending_priority_update: None,
             handled_connection_error: None,
             pending_recv_streams: Vec::with_capacity(3),
             got_peer_settings: false,
@@ -546,6 +580,57 @@ where
         Ok(())
     }
 
+    /// Flush queued request priority updates on the single client control stream.
+    pub(crate) fn poll_priority_updates(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<(), ConnectionError> {
+        self.shared.waker().register(cx.waker());
+        loop {
+            if self.pending_priority_update.is_none() {
+                self.pending_priority_update = self
+                    .shared
+                    .take_priority_update()
+                    .map(|update| (update, false));
+            }
+            let Some((update, sent)) = self.pending_priority_update.as_mut() else {
+                return Ok(());
+            };
+            match self.control_send.poll_ready(cx) {
+                Poll::Pending => return Ok(()),
+                Poll::Ready(Ok(())) => {
+                    if *sent {
+                        let (update, _) = self.pending_priority_update.take().unwrap();
+                        let _ = update.completed.send(());
+                    } else {
+                        let frame: Frame<B> = Frame::PriorityUpdate {
+                            element_id: update.element_id,
+                            field_value: update.bytes.clone(),
+                        };
+                        if let Err(error) = self.control_send.send_data(frame) {
+                            return Err(self.handle_connection_error(
+                                InternalConnectionError::new(
+                                    Code::H3_CLOSED_CRITICAL_STREAM,
+                                    format!("control stream write failed: {error}"),
+                                ),
+                            ));
+                        }
+                        *sent = true;
+                    }
+                }
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Err(self.handle_connection_error(connection_error)),
+                Poll::Ready(Err(error)) => {
+                    return Err(self.handle_connection_error(InternalConnectionError::new(
+                        Code::H3_CLOSED_CRITICAL_STREAM,
+                        format!("control stream write failed: {error}"),
+                    )))
+                }
+            }
+        }
+    }
+
     /// Drives the peer's QPACK encoder stream and flushes decoder instructions.
     pub fn poll_qpack(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError>
     where
@@ -594,7 +679,11 @@ where
         }
 
         let queued = self.shared.take_qpack_decoder_instructions();
-        self.qpack_decoder_send_buf.extend_from_slice(&queued);
+        queue_qpack_instructions(
+            &mut self.qpack_decoder_send_buf,
+            &mut self.qpack_decoder_pending_prefix,
+            &queued,
+        );
         while self.qpack_decoder_send_buf.has_remaining() {
             let sent = match self.qpack_streams.decoder_send.as_mut() {
                 Some(stream) => stream.poll_send(cx, &mut self.qpack_decoder_send_buf),
@@ -631,21 +720,32 @@ where
 
     #[cfg(test)]
     #[allow(missing_docs)]
-    pub async fn send_qpack_encoder_instructions_for_test(&mut self, mut bytes: Bytes)
+    pub async fn send_qpack_encoder_instructions_for_test(&mut self, bytes: Bytes)
     where
         C::SendStream: SendStreamUnframed<B>,
     {
+        queue_qpack_instructions(
+            &mut self.qpack_encoder_send_buf,
+            &mut self.qpack_encoder_pending_prefix,
+            &bytes,
+        );
         let stream = self
             .qpack_streams
             .encoder_send
             .as_mut()
             .expect("QPACK encoder stream");
-        while bytes.has_remaining() {
-            let written = future::poll_fn(|cx| stream.poll_send(cx, &mut bytes))
-                .await
-                .expect("send QPACK encoder instructions");
-            assert!(written > 0, "QPACK encoder stream made no progress");
-        }
+        future::poll_fn(|cx| {
+            while self.qpack_encoder_send_buf.has_remaining() {
+                match stream.poll_send(cx, &mut self.qpack_encoder_send_buf) {
+                    Poll::Pending | Poll::Ready(Ok(0)) => return Poll::Pending,
+                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                }
+            }
+            Poll::Ready(Ok(()))
+        })
+        .await
+        .expect("send QPACK encoder instructions");
     }
 
     #[cfg(test)]
@@ -980,16 +1080,47 @@ where
     }
 }
 
+impl<C, B> Drop for ConnectionInner<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    fn drop(&mut self) {
+        self.shared.cancel_priority_updates();
+        // Notify local readers without sending an additional transport close.
+        // SharedState preserves any terminal error already observed by the driver.
+        self.shared.set_conn_error(
+            InternalConnectionError::new(
+                Code::H3_INTERNAL_ERROR,
+                "HTTP/3 connection driver dropped".to_string(),
+            )
+            .into(),
+        );
+    }
+}
+
 #[allow(missing_docs)]
 pub struct RequestStream<S, B> {
     pub(super) stream: FrameStream<S, B>,
     pub(super) trailers: Option<Bytes>,
+    pub(super) pending_response_headers: Option<Bytes>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
+    close_waiter: Option<ConnectionCloseWaiter>,
+    qpack_waiter: Option<QpackWaiter>,
+    reset_observer_finished: bool,
 }
 
 impl<S, B> RequestStream<S, B> {
+    pub(crate) fn take_close_waiter(&mut self) -> Option<ConnectionCloseWaiter> {
+        self.close_waiter.take()
+    }
+
+    pub(crate) fn take_qpack_waiter(&mut self) -> Option<QpackWaiter> {
+        self.qpack_waiter.take()
+    }
+
     #[allow(missing_docs)]
     pub fn new(
         stream: FrameStream<S, B>,
@@ -1002,7 +1133,11 @@ impl<S, B> RequestStream<S, B> {
             conn_state,
             max_field_section_size,
             trailers: None,
+            pending_response_headers: None,
             send_grease_frame: grease,
+            close_waiter: None,
+            qpack_waiter: None,
+            reset_observer_finished: false,
         }
     }
 }
@@ -1015,23 +1150,87 @@ impl<S, B> ConnectionState for RequestStream<S, B> {
 
 impl<S, B> CloseStream for RequestStream<S, B> {}
 
+impl<S: quic::RecvStreamReset, B> RequestStream<S, B> {
+    pub(crate) fn poll_recv_terminal_error(
+        &mut self,
+        cx: &mut Context<'_>,
+        observer_cx: &mut Context<'_>,
+        registration: &mut Option<ConnectionCloseWaiter>,
+    ) -> Poll<StreamError> {
+        if !self.reset_observer_finished {
+            match quic::RecvStreamReset::poll_received_reset(&mut self.stream.stream, observer_cx) {
+                Poll::Ready(Ok(Some(code))) => {
+                    *registration = None;
+                    return Poll::Ready(StreamError::RemoteTerminate {
+                        code: Code::from(code),
+                    });
+                }
+                Poll::Ready(Err(error)) => {
+                    *registration = None;
+                    return Poll::Ready(self.handle_quic_stream_error(error));
+                }
+                Poll::Ready(Ok(None)) => self.reset_observer_finished = true,
+                Poll::Pending => (),
+            }
+        }
+        // EOF ends reset observation, not this wait. Driver errors and driver
+        // cancellation are published through the shared terminal notification.
+        let error = ready!(self.conn_state.poll_closed(cx, registration));
+        *registration = None;
+        Poll::Ready(StreamError::ConnectionError(
+            crate::error::connection_error_creators::convert_to_connection_error(error),
+        ))
+    }
+}
+
 impl<S, B> RequestStream<S, B>
 where
     S: quic::RecvStream,
 {
+    pub(crate) fn poll_next_response_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+        after_trailers: bool,
+        registration: &mut Option<ConnectionCloseWaiter>,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
+        let frame = if after_trailers {
+            self.stream.poll_next_after_trailers(cx)
+        } else {
+            self.stream.poll_next(cx)
+        };
+        if matches!(frame, Poll::Ready(Err(FrameStreamError::UnexpectedEnd)))
+            && self.stream.waits_for_incomplete_header()
+        {
+            let error = ready!(self.conn_state.poll_closed(cx, registration));
+            *registration = None;
+            return Poll::Ready(Err(StreamError::ConnectionError(
+                crate::error::connection_error_creators::convert_to_connection_error(error),
+            )));
+        }
+        *registration = None;
+        frame.map_err(|error| self.handle_frame_stream_error_on_request_stream(error))
+    }
+
     /// Receive some of the request/response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, StreamError>> {
+        let mut registration = self.close_waiter.take();
+        let result = self.poll_recv_data_with_waiter(cx, &mut registration);
+        self.close_waiter = registration;
+        result
+    }
+
+    pub(crate) fn poll_recv_data_with_waiter(
+        &mut self,
+        cx: &mut Context<'_>,
+        registration: &mut Option<ConnectionCloseWaiter>,
+    ) -> Poll<Result<Option<impl Buf>, StreamError>> {
         if !self.stream.has_data() {
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(
-                        self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
-                }
+            match ready!(self.poll_next_response_frame(cx, false, registration)) {
+                Err(error) => return Poll::Ready(Err(error)),
                 Ok(None) => return Poll::Ready(Ok(None)),
                 Ok(Some(Frame::Headers(encoded))) => {
                     self.trailers = Some(encoded);
@@ -1084,15 +1283,29 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        let mut registration = self.close_waiter.take();
+        let mut qpack_registration = self.qpack_waiter.take();
+        let result =
+            self.poll_recv_trailers_with_waiter(cx, &mut registration, &mut qpack_registration);
+        if result.is_ready() {
+            qpack_registration = None;
+        }
+        self.close_waiter = registration;
+        self.qpack_waiter = qpack_registration;
+        result
+    }
+
+    pub(crate) fn poll_recv_trailers_with_waiter(
+        &mut self,
+        cx: &mut Context<'_>,
+        registration: &mut Option<ConnectionCloseWaiter>,
+        qpack_registration: &mut Option<QpackWaiter>,
+    ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
         let trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(
-                        self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
-                }
+            match ready!(self.poll_next_response_frame(cx, false, registration)) {
+                Err(error) => return Poll::Ready(Err(error)),
                 Ok(None) => return Poll::Ready(Ok(None)),
                 Ok(Some(Frame::Headers(encoded))) => encoded,
                 Ok(Some(other_frame)) => {
@@ -1135,12 +1348,8 @@ where
             //# Receipt of an invalid sequence of frames MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
 
-            match self.stream.poll_next(cx) {
-                Poll::Ready(Err(frame_stream_error)) => {
-                    return Poll::Ready(Err(
-                        self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
-                }
+            match self.poll_next_response_frame(cx, true, registration) {
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(Some(trailing_frame))) => {
                     // Received a known frame after trailers -> fail.
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
@@ -1179,7 +1388,10 @@ where
                     }));
                 }
                 Err(qpack::DecoderError::MissingRefs(required)) => {
-                    match self.conn_state.poll_qpack_insert_count(required, cx) {
+                    match self
+                        .conn_state
+                        .poll_qpack_insert_count(required, cx, qpack_registration)
+                    {
                         Poll::Ready(Ok(())) => continue,
                         Poll::Ready(Err(error)) => {
                             return Poll::Ready(Err(StreamError::ConnectionError(
@@ -1206,6 +1418,7 @@ where
             }
         };
 
+        *qpack_registration = None;
         if dyn_ref {
             self.conn_state.queue_qpack_header_ack(stream_id);
         }
@@ -1232,6 +1445,9 @@ where
     #[allow(missing_docs)]
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, err_code: Code) {
+        self.close_waiter = None;
+        self.qpack_waiter = None;
+        self.pending_response_headers = None;
         self.stream.stop_sending(err_code);
     }
 }
@@ -1341,16 +1557,24 @@ where
             RequestStream {
                 stream: send,
                 trailers: None,
+                pending_response_headers: None,
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
+                close_waiter: None,
+                qpack_waiter: None,
+                reset_observer_finished: false,
             },
             RequestStream {
                 stream: recv,
                 trailers: self.trailers,
+                pending_response_headers: self.pending_response_headers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
+                close_waiter: self.close_waiter,
+                qpack_waiter: self.qpack_waiter,
+                reset_observer_finished: self.reset_observer_finished,
             },
         )
     }

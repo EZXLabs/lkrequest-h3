@@ -29,6 +29,15 @@ use super::{init_tracing, Pair};
 
 #[tokio::test]
 async fn client_decodes_response_blocked_on_qpack_dynamic_insert() {
+    response_blocked_on_qpack_dynamic_insert(false).await;
+}
+
+#[tokio::test]
+async fn client_decodes_response_blocked_on_qpack_dynamic_insert_with_deferred_prefix() {
+    response_blocked_on_qpack_dynamic_insert(true).await;
+}
+
+async fn response_blocked_on_qpack_dynamic_insert(defer_prefixes: bool) {
     init_tracing();
     let mut pair = Pair::default();
     let mut server = pair.server();
@@ -39,6 +48,7 @@ async fn client_decodes_response_blocked_on_qpack_dynamic_insert() {
         let mut builder = client::builder();
         builder.qpack_max_table_capacity(4096);
         builder.qpack_blocked_streams(100);
+        builder.defer_qpack_stream_prefixes(defer_prefixes);
         let (mut driver, mut client) = builder
             .build::<_, _, Bytes>(pair.client().await)
             .await

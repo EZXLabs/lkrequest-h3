@@ -32,6 +32,14 @@ pub struct Config {
     /// Use Chromium's GREASE values and omit request/extra unidirectional GREASE.
     pub(crate) chromium_grease: bool,
 
+    /// Delay QPACK stream types until their first nonempty instruction batch.
+    pub(crate) defer_qpack_stream_prefixes: bool,
+
+    /// Browser-specific response payload EOF compatibility; not a wire setting.
+    pub(crate) accept_truncated_response_payloads: bool,
+    /// Wait for connection termination after FIN with a partial response frame header.
+    pub(crate) wait_for_incomplete_response_frame_headers: bool,
+
     #[cfg(test)]
     pub(crate) send_settings: bool,
 
@@ -132,6 +140,9 @@ impl TryFrom<Config> for frame::Settings {
         let Config {
             send_grease,
             chromium_grease,
+            defer_qpack_stream_prefixes: _,
+            accept_truncated_response_payloads: _,
+            wait_for_incomplete_response_frame_headers: _,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -279,6 +290,9 @@ impl Default for Config {
         Self {
             send_grease: true,
             chromium_grease: false,
+            defer_qpack_stream_prefixes: false,
+            accept_truncated_response_payloads: false,
+            wait_for_incomplete_response_frame_headers: false,
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),

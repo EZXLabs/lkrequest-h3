@@ -234,6 +234,21 @@ pub trait RecvStream {
     fn recv_id(&self) -> StreamId;
 }
 
+/// Optional observation of a peer reset without consuming received payload.
+///
+/// Normal payload and FIN remain available to [`RecvStream::poll_data`]. A
+/// reported reset is terminal and repeated observations must retain its code.
+pub trait RecvStreamReset: RecvStream {
+    /// Poll for a real peer reset. `Some(code)` reports RESET_STREAM; `None`
+    /// means reset observation has ended, for example after local stop or EOF.
+    /// `None` does not imply successful HTTP message completion. A pending call
+    /// registers the current waker, which a later poll may replace.
+    fn poll_received_reset(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>>;
+}
+
 /// Optional trait to allow "splitting" a bidirectional stream into two sides.
 pub trait BidiStream<B: Buf>: SendStream<B> + RecvStream {
     /// The type for the send half.

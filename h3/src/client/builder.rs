@@ -100,6 +100,15 @@ impl Builder {
         self
     }
 
+    /// Delay each QPACK stream's type until its first nonempty instruction batch.
+    ///
+    /// Streams retain their allocated identifiers. Disabled by default, which
+    /// preserves eager stream-type emission during connection initialization.
+    pub fn defer_qpack_stream_prefixes(&mut self, enabled: bool) -> &mut Self {
+        self.config.defer_qpack_stream_prefixes = enabled;
+        self
+    }
+
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
     /// to prevent potential interoperability issues in the future.
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
@@ -122,6 +131,22 @@ impl Builder {
     /// Disabled by default to preserve the generic GREASE behavior.
     pub fn chromium_grease(&mut self, enabled: bool) -> &mut Self {
         self.config.chromium_grease = enabled;
+        self
+    }
+
+    /// Accept truncated DATA, HEADERS and unknown response payloads at FIN.
+    ///
+    /// This browser compatibility option requires complete frame headers and
+    /// preserves known-frame ordering checks. Disabled by default.
+    pub fn accept_truncated_response_payloads(&mut self, enabled: bool) -> &mut Self {
+        self.config.accept_truncated_response_payloads = enabled;
+        self
+    }
+
+    /// Wait for connection termination when response FIN leaves a partial frame
+    /// type or length. Disabled by default; does not affect payload EOF handling.
+    pub fn wait_for_incomplete_response_frame_headers(&mut self, enabled: bool) -> &mut Self {
+        self.config.wait_for_incomplete_response_frame_headers = enabled;
         self
     }
 
@@ -202,6 +227,10 @@ impl Builder {
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame,
             pseudo_header_order,
+            accept_truncated_response_payloads: self.config.accept_truncated_response_payloads,
+            wait_for_incomplete_response_frame_headers: self
+                .config
+                .wait_for_incomplete_response_frame_headers,
             _buf: PhantomData,
         };
 

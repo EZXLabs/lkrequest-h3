@@ -74,13 +74,13 @@ where
             return Poll::Ready(Err(error.clone()));
         };
 
-        // Check if the connection is in error state
+        self.waker().register(cx.waker());
+        // Register before checking so publication cannot fall between them.
         if let Some(err) = self.get_conn_error() {
             let err = self.close_if_needed(err);
             // err might be a different error so match again
             return Poll::Ready(Err(self.convert_to_connection_error(err)));
         }
-        self.waker().register(cx.waker());
         Poll::Pending
     }
 
